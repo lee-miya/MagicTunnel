@@ -1,0 +1,24 @@
+[log]
+level = "info"
+
+[tls]
+ca = "certs/ca.pem"
+cert = "certs/client1.pem"
+key = "certs/client1.key"
+
+[obfs]
+# Must match every hop's obfs.xor_key. Obfuscation only; TLS provides the real encryption.
+xor_key = "change-me-to-a-long-random-string"
+
+[tun]
+name = "mt0"
+mtu = 1200
+
+# Full path, first hop first. The last hop is the exit node.
+[[route]]
+addr = "192.0.2.10:4433"
+server_name = "relay1"
+
+[[route]]
+addr = "198.51.100.20:4433"
+server_name = "exit1"

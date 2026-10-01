@@ -1,0 +1,20 @@
+listen = "0.0.0.0:4433"
+
+[log]
+level = "info"
+
+[tls]
+ca = "certs/ca.pem"
+cert = "certs/exit1.pem"
+key = "certs/exit1.key"
+
+[obfs]
+xor_key = "change-me-to-a-long-random-string"
+
+# Omit this section on pure relay nodes.
+[exit]
+pool = "10.88.0.0/24"
+
+[exit.tun]
+name = "mt0"
+mtu = 1200

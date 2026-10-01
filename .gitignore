@@ -1,0 +1,5 @@
+/target
+/certs
+*.key
+/.cursor/
+AGENTS.md

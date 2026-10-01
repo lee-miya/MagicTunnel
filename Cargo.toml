@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/transport",
+    "crates/client",
+    "crates/server",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# internal crates
+magictunnel-common = { path = "crates/common" }
+magictunnel-transport = { path = "crates/transport" }
+
+# async runtime / bytes
+tokio = { version = "1.53", features = ["full"] }
+bytes = "1.12"
+
+# QUIC + TLS (quinn 0.11 is built on rustls 0.23)
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
+rustls-pki-types = { version = "1.15", features = ["std"] }
+
+# TUN
+tun-rs = { version = "2.8", features = ["async"] }
+
+# config / serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+ipnet = { version = "2.12", features = ["serde"] }
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# CLI / errors
+clap = { version = "4.6", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "2.0"
+
+# certificate generation (xtask only)
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = { version = "0.3", features = ["std"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

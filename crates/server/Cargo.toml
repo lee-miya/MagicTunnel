@@ -1,0 +1,22 @@
+[package]
+name = "magictunnel-server"
+description = "magicTunnel server: relays QUIC datagrams hop by hop and NATs traffic at the exit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "mt-server"
+path = "src/main.rs"
+
+[dependencies]
+magictunnel-common.workspace = true
+magictunnel-transport.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+tun-rs.workspace = true
+ipnet.workspace = true
+tracing.workspace = true
+clap.workspace = true
+anyhow.workspace = true
