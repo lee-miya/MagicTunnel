@@ -5,12 +5,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use magictunnel_common::config::DEFAULT_TUN_MTU;
+use magictunnel_common::config::{DEFAULT_TUN_MTU, QuicConfig};
+use magictunnel_common::metrics::Traffic;
 use magictunnel_common::proto::{HelloReply, Hop};
 use magictunnel_transport::quinn::{self, Endpoint};
 use magictunnel_transport::{
-    TlsMaterial, XorKey, accept_hello, client_endpoint, connect, hello, recv_packet, relay,
-    send_packet, server_endpoint,
+    Sent, TlsMaterial, XorKey, accept_hello, client_endpoint, connect, hello, recv_packet,
+    recv_packets, relay, send_packet, send_packet_wait, server_endpoint,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -79,13 +80,14 @@ fn tunnel_reply() -> HelloReply {
         tunnel_ip: "10.88.0.2".parse().unwrap(),
         prefix_len: 24,
         mtu: DEFAULT_TUN_MTU,
+        token: None,
     }
 }
 
 /// Exit node: completes the handshake with each peer, then echoes every datagram. Peers that
 /// fail the handshake are skipped, as the negative tests expect.
 fn spawn_exit(tls: &TlsMaterial) -> SocketAddr {
-    let endpoint = server_endpoint(localhost(), xor_key(KEY), tls).unwrap();
+    let endpoint = server_endpoint(localhost(), xor_key(KEY), tls, &QuicConfig::default()).unwrap();
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
@@ -106,20 +108,19 @@ fn spawn_exit(tls: &TlsMaterial) -> SocketAddr {
 /// Relay node: dials the next hop named in the handshake, relays the reply back, then
 /// forwards datagrams in both directions.
 fn spawn_relay(tls: &TlsMaterial) -> SocketAddr {
-    let endpoint = server_endpoint(localhost(), xor_key(KEY), tls).unwrap();
+    let endpoint = server_endpoint(localhost(), xor_key(KEY), tls, &QuicConfig::default()).unwrap();
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(async move {
         let upstream = endpoint.accept().await.unwrap().await.unwrap();
-        let (mut control, hello) = accept_hello(&upstream).await.unwrap();
-        let (next, rest) = hello.remaining.split_first().unwrap();
+        let (mut control, request) = accept_hello(&upstream).await.unwrap();
+        let (next, rest) = request.remaining.split_first().unwrap();
         let downstream = connect(&endpoint, next.addr, &next.server_name)
             .await
             .unwrap();
-        let (_next_control, reply) = magictunnel_transport::hello(&downstream, rest.to_vec())
-            .await
-            .unwrap();
+        let (_next_control, reply) = hello(&downstream, rest.to_vec(), None).await.unwrap();
         control.send(&reply).await.unwrap();
-        relay(&upstream, &downstream).await;
+        let meter = || Arc::new(Traffic::new());
+        relay(upstream, downstream, meter(), meter()).await;
         drop(endpoint);
     });
     addr
@@ -133,7 +134,7 @@ async fn assert_echo(conn: &quinn::Connection) {
     );
     for i in 0..10u8 {
         let packet = Bytes::from(vec![i; usize::from(DEFAULT_TUN_MTU)]);
-        send_packet(conn, packet.clone()).unwrap();
+        assert_eq!(send_packet(conn, packet.clone()).unwrap(), Sent::Queued);
         let echoed = tokio::time::timeout(Duration::from_secs(5), recv_packet(conn))
             .await
             .expect("echo timed out")
@@ -148,7 +149,7 @@ async fn dial(
     addr: SocketAddr,
     server_name: &str,
 ) -> (Endpoint, magictunnel_transport::Result<quinn::Connection>) {
-    let endpoint = client_endpoint(addr, xor_key(key), tls).unwrap();
+    let endpoint = client_endpoint(addr, xor_key(key), tls, &QuicConfig::default()).unwrap();
     let conn = connect(&endpoint, addr, server_name).await;
     (endpoint, conn)
 }
@@ -160,7 +161,7 @@ async fn single_hop_handshake_and_datagrams() {
 
     let (_endpoint, conn) = dial(&ca.node("client1"), KEY, exit, "exit1").await;
     let conn = conn.unwrap();
-    let (_control, reply) = hello(&conn, vec![]).await.unwrap();
+    let (_control, reply) = hello(&conn, vec![], None).await.unwrap();
     assert_eq!(reply, tunnel_reply());
     assert_echo(&conn).await;
 }
@@ -177,7 +178,31 @@ async fn two_hop_relay() {
         addr: exit,
         server_name: "exit1".into(),
     }];
-    let (_control, reply) = hello(&conn, route).await.unwrap();
+    let (_control, reply) = hello(&conn, route, None).await.unwrap();
+    assert_eq!(reply, tunnel_reply());
+    assert_echo(&conn).await;
+}
+
+#[tokio::test]
+async fn three_hop_relay() {
+    let ca = Ca::new("test CA");
+    let exit = spawn_exit(&ca.node("exit1"));
+    let relay2 = spawn_relay(&ca.node("relay2"));
+    let relay1 = spawn_relay(&ca.node("relay1"));
+
+    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, relay1, "relay1").await;
+    let conn = conn.unwrap();
+    let route = vec![
+        Hop {
+            addr: relay2,
+            server_name: "relay2".into(),
+        },
+        Hop {
+            addr: exit,
+            server_name: "exit1".into(),
+        },
+    ];
+    let (_control, reply) = hello(&conn, route, None).await.unwrap();
     assert_eq!(reply, tunnel_reply());
     assert_echo(&conn).await;
 }
@@ -192,7 +217,7 @@ async fn rejects_client_from_foreign_ca() {
     // rejection may only surface once the control stream is used.
     let client = rogue.node_trusting("client1", &ca);
     let (_endpoint, conn) = dial(&client, KEY, exit, "exit1").await;
-    let result = async { hello(&conn?, vec![]).await }.await;
+    let result = async { hello(&conn?, vec![], None).await }.await;
     assert!(
         result.is_err(),
         "server accepted a client from a foreign CA"
@@ -240,10 +265,78 @@ async fn plain_quic_client_never_connects() {
     let exit = spawn_exit(&ca.node("exit1"));
 
     let mut endpoint = Endpoint::client(localhost()).unwrap();
-    endpoint.set_default_client_config(ca.node("client1").client_config().unwrap());
+    endpoint.set_default_client_config(
+        ca.node("client1")
+            .client_config(&QuicConfig::default())
+            .unwrap(),
+    );
     let attempt = tokio::time::timeout(NO_CONNECT_WAIT, connect(&endpoint, exit, "exit1"));
     match attempt.await {
         Err(_elapsed) => {}
         Ok(conn) => assert!(conn.is_err()),
     }
+}
+
+#[tokio::test]
+async fn random_probes_get_no_reply() {
+    let ca = Ca::new("test CA");
+    let exit = spawn_exit(&ca.node("exit1"));
+    let socket = tokio::net::UdpSocket::bind(localhost()).await.unwrap();
+    socket.connect(exit).await.unwrap();
+
+    // Without the key every probe decodes to random bytes; before long headers of foreign
+    // versions were dropped, about 1 in 300 of these drew a Version Negotiation reply.
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut probe = vec![0u8; 1400];
+    for round in 0..30 {
+        for _ in 0..100 {
+            for chunk in probe.chunks_mut(8) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+            }
+            socket.send(&probe).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let mut reply = [0u8; 2048];
+        assert!(
+            socket.try_recv(&mut reply).is_err(),
+            "probe round {round} drew a reply"
+        );
+    }
+    let mut reply = [0u8; 2048];
+    let late = tokio::time::timeout(Duration::from_millis(500), socket.recv(&mut reply)).await;
+    assert!(late.is_err(), "a probe drew a reply");
+}
+
+#[tokio::test]
+async fn batches_queued_datagrams_and_waits_for_buffer_space() {
+    let ca = Ca::new("test CA");
+    let exit = spawn_exit(&ca.node("exit1"));
+    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, exit, "exit1").await;
+    let conn = conn.unwrap();
+    let (_control, _) = hello(&conn, vec![], None).await.unwrap();
+
+    let count = 50u8;
+    for i in 0..count {
+        let packet = Bytes::from(vec![i; 1000]);
+        assert_eq!(send_packet_wait(&conn, packet).await.unwrap(), Sent::Queued);
+    }
+    let oversized = Bytes::from(vec![0; 64 * 1024]);
+    assert_eq!(
+        send_packet_wait(&conn, oversized).await.unwrap(),
+        Sent::TooLarge
+    );
+
+    let mut got = Vec::new();
+    while got.len() < usize::from(count) {
+        tokio::time::timeout(Duration::from_secs(5), recv_packets(&conn, &mut got, 128))
+            .await
+            .expect("echo timed out")
+            .unwrap();
+    }
+    // Loopback does not reorder or lose, so the echoes arrive in order.
+    let firsts: Vec<u8> = got.iter().map(|p| p[0]).collect();
+    assert_eq!(firsts, (0..count).collect::<Vec<_>>());
 }

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use magictunnel_common::config::TlsConfig;
+use magictunnel_common::config::{QuicConfig, TlsConfig};
 use magictunnel_common::proto::ALPN;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use rustls::RootCertStore;
@@ -48,7 +48,7 @@ impl TlsMaterial {
     }
 
     /// Config for dialing a hop: verifies the hop's certificate and name, presents ours.
-    pub fn client_config(&self) -> Result<quinn::ClientConfig> {
+    pub fn client_config(&self, quic: &QuicConfig) -> Result<quinn::ClientConfig> {
         let mut crypto = rustls::ClientConfig::builder_with_provider(provider())
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .with_root_certificates(self.roots.clone())
@@ -56,12 +56,12 @@ impl TlsMaterial {
         crypto.alpn_protocols = vec![ALPN.to_vec()];
 
         let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto)?));
-        config.transport_config(Arc::new(transport_config()));
+        config.transport_config(Arc::new(transport_config(quic)));
         Ok(config)
     }
 
     /// Config for accepting peers: requires a client certificate signed by our CA.
-    pub fn server_config(&self) -> Result<quinn::ServerConfig> {
+    pub fn server_config(&self, quic: &QuicConfig) -> Result<quinn::ServerConfig> {
         let verifier =
             WebPkiClientVerifier::builder_with_provider(self.roots.clone(), provider()).build()?;
         let mut crypto = rustls::ServerConfig::builder_with_provider(provider())
@@ -72,7 +72,7 @@ impl TlsMaterial {
 
         let mut config =
             quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto)?));
-        config.transport_config(Arc::new(transport_config()));
+        config.transport_config(Arc::new(transport_config(quic)));
         Ok(config)
     }
 }

@@ -1,4 +1,5 @@
 [log]
+# tracing filter, e.g. "info" or "info,mt_client=debug"; RUST_LOG overrides it.
 level = "info"
 
 [tls]
@@ -11,8 +12,34 @@ key = "certs/client1.key"
 xor_key = "change-me-to-a-long-random-string"
 
 [tun]
-name = "mt0"
+# Defaults to "mt0" on Linux and Windows. On macOS it must be "utun" (the kernel picks a
+# free unit, the default) or "utunN".
+# name = "mt0"
+# Upper bound; the client lowers it to what the whole path carries. 1200 always fits.
 mtu = 1200
+# Linux: exchange TSO/GRO super-packets with the kernel. Ignored on macOS and Windows.
+# offload = true
+
+# QUIC settings of the link to the first hop.
+[quic]
+# keepalive_secs = 10
+# A silent first hop counts as dead after this; the smaller of both ends' values applies.
+# idle_timeout_secs = 30
+# "cubic", "bbr" (often faster on lossy long-distance links) or "newreno".
+# congestion = "cubic"
+
+[reconnect]
+# On a broken tunnel, keep the TUN and routes (traffic waits instead of leaking onto the
+# local network) and dial the route again, backing off up to max_delay_secs. The exit gives
+# the same tunnel address back, so open TCP connections usually survive.
+# enabled = true
+# max_delay_secs = 30
+
+[metrics]
+# Prometheus text format on GET /metrics; plain HTTP, keep it on loopback.
+# listen = "127.0.0.1:9100"
+# Log a traffic summary every N seconds; 0 disables it.
+# log_interval_secs = 0
 
 # Full path, first hop first. The last hop is the exit node.
 [[route]]

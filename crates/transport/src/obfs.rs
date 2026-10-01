@@ -28,6 +28,9 @@ use crate::{Error, Result};
 /// Bytes prepended to every UDP datagram.
 pub const NONCE_LEN: usize = 4;
 
+/// The only QUIC version any magicTunnel node speaks.
+const QUIC_V1: [u8; 4] = [0, 0, 0, 1];
+
 const OFFSETS: usize = 1 << 16;
 /// Upper bound on a single UDP payload (IPv6 jumbograms aside).
 const MAX_DATAGRAM: usize = 1 << 16;
@@ -86,7 +89,7 @@ impl XorKey {
 
     /// De-obfuscates `buf[..len]`, holding datagrams at `stride` boundaries, in place and
     /// compacts the payloads to the front. Returns the new `(len, stride)`. Datagrams too short
-    /// to carry a nonce are dropped.
+    /// to carry a nonce, and long-header packets of any version but QUIC v1, are dropped.
     fn decode_in_place(&self, buf: &mut [u8], len: usize, stride: usize) -> (usize, usize) {
         if stride <= NONCE_LEN {
             // Leave `stride` non-zero: quinn splits the buffer by it.
@@ -103,7 +106,9 @@ impl XorKey {
             let payload_len = end - read - NONCE_LEN;
             buf.copy_within(read + NONCE_LEN..end, write);
             self.apply(nonce, &mut buf[write..write + payload_len]);
-            write += payload_len;
+            if !is_foreign_version(&buf[write..write + payload_len]) {
+                write += payload_len;
+            }
             read = end;
         }
         (write, stride - NONCE_LEN)
@@ -202,6 +207,13 @@ impl AsyncUdpSocket for XorSocket {
     }
 }
 
+/// quinn answers a long-header packet of an unknown version (≥ 1200 bytes) with Version
+/// Negotiation. A probe sent without the key decodes to random bytes, so about 1 in 300 large
+/// probes would draw a reply and reveal the listener; no genuine peer ever needs one.
+fn is_foreign_version(payload: &[u8]) -> bool {
+    payload[0] & 0x80 != 0 && payload.get(1..5) != Some(&QUIC_V1[..])
+}
+
 fn fnv1a(data: &[u8]) -> u64 {
     data.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &b| {
         (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -255,7 +267,10 @@ mod tests {
     fn segmented_round_trip_with_short_tail() {
         let key = key();
         let segment = 100;
-        let plain: Vec<u8> = (0..350).map(|i| (i * 7) as u8).collect();
+        let mut plain: Vec<u8> = (0..350).map(|i| (i * 7) as u8).collect();
+        for datagram in plain.chunks_mut(segment) {
+            datagram[0] = 0x40; // short header
+        }
         let mut wire = Vec::new();
         key.encode(&plain, segment, &mut wire, counter_nonces());
         assert_eq!(wire.len(), plain.len() + 4 * NONCE_LEN);
@@ -304,6 +319,24 @@ mod tests {
         let (len, stride) = key.decode_in_place(&mut wire, wire_len, 6 + NONCE_LEN);
         assert_eq!((len, stride), (6, 6));
         assert_eq!(&wire[..len], &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn drops_long_headers_of_other_versions() {
+        let key = key();
+        let v1 = [0xc0, 0, 0, 0, 1, 1, 1, 1];
+        let v2 = [0xc0, 0x6b, 0x33, 0x43, 0xcf, 2, 2, 2];
+        let short = [0x40, 3, 3, 3, 3, 3, 3, 3];
+        let version_negotiation = [0x80, 0, 0, 0, 0, 4, 4, 4];
+        let truncated = [0xc0, 0, 0];
+        let plain = [&v1[..], &v2, &short, &version_negotiation, &truncated].concat();
+
+        let mut wire = Vec::new();
+        key.encode(&plain, 8, &mut wire, counter_nonces());
+        let wire_len = wire.len();
+        let (len, stride) = key.decode_in_place(&mut wire, wire_len, 8 + NONCE_LEN);
+        assert_eq!(stride, 8);
+        assert_eq!(&wire[..len], &[&v1[..], &short].concat()[..]);
     }
 
     #[test]

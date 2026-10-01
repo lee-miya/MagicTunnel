@@ -1,0 +1,12 @@
+[package]
+name = "magictunnel-tunio"
+description = "Batched TUN I/O with Linux GSO/GRO offload for the magicTunnel data plane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+tun-rs.workspace = true
+tracing.workspace = true

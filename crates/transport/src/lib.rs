@@ -8,8 +8,14 @@ pub mod error;
 pub mod obfs;
 pub mod tls;
 
-pub use control::{ControlStream, accept_hello, hello};
-pub use datagram::{recv_packet, relay, send_packet};
+pub use control::{
+    ControlStream, HANDSHAKE_TIMEOUT, HOP_CONNECT_TIMEOUT, HOP_SETUP_BUDGET, accept_hello, hello,
+    hello_timeout,
+};
+pub use datagram::{
+    FRAG_NEEDED_SENT, OVERSIZED_DROPS, Sent, recv_packet, recv_packets, relay, send_packet,
+    send_packet_wait, too_large_reply,
+};
 pub use endpoint::{bind_obfuscated, client_endpoint, connect, server_endpoint, transport_config};
 pub use error::{Error, Result};
 pub use obfs::{XorKey, XorSocket};

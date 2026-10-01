@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use magictunnel_common::proto::{Hello, HelloReply, Hop, PROTOCOL_VERSION};
+use magictunnel_common::proto::{Hello, HelloReply, Hop, MAX_HOPS, PROTOCOL_VERSION, Resume};
 use quinn::{Connection, ReadExactError, RecvStream, SendStream};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -11,7 +11,20 @@ use serde::de::DeserializeOwned;
 use crate::{Error, Result};
 
 pub const MAX_FRAME_LEN: usize = 64 * 1024;
+/// How long the accepting side waits for a [`Hello`], and the dialer's wait for the reply when
+/// the peer is the exit.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Extra reply wait the dialer allows for every hop after its peer.
+pub const HOP_SETUP_BUDGET: Duration = Duration::from_secs(5);
+/// How long a relay may spend dialing its next hop. Kept below [`HOP_SETUP_BUDGET`] so that a
+/// relay that gives up can still report why before the hop behind it times out.
+pub const HOP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+const _: () = assert!(HOP_CONNECT_TIMEOUT.as_millis() < HOP_SETUP_BUDGET.as_millis());
+
+/// The dialer's wait for a [`HelloReply`] when `remaining` hops follow its peer.
+pub fn hello_timeout(remaining: usize) -> Duration {
+    HANDSHAKE_TIMEOUT + HOP_SETUP_BUDGET * remaining.min(MAX_HOPS) as u32
+}
 
 #[derive(Debug)]
 pub struct ControlStream {
@@ -64,15 +77,21 @@ impl ControlStream {
     }
 }
 
-/// Dialing side of the handshake: tells the peer which hops follow it and waits for the
-/// exit's reply (relayed back hop by hop).
-pub async fn hello(conn: &Connection, remaining: Vec<Hop>) -> Result<(ControlStream, HelloReply)> {
-    with_timeout(async {
+/// Dialing side of the handshake: tells the peer which hops follow it (and, when resuming,
+/// which address to ask the exit for) and waits for the exit's reply (relayed back hop by
+/// hop), allowing [`hello_timeout`] for it.
+pub async fn hello(
+    conn: &Connection,
+    remaining: Vec<Hop>,
+    resume: Option<Resume>,
+) -> Result<(ControlStream, HelloReply)> {
+    with_timeout(hello_timeout(remaining.len()), async {
         let mut control = ControlStream::open(conn).await?;
         control
             .send(&Hello {
                 version: PROTOCOL_VERSION,
                 remaining,
+                resume,
             })
             .await?;
         let reply = control.recv().await?;
@@ -85,7 +104,7 @@ pub async fn hello(conn: &Connection, remaining: Vec<Hop>) -> Result<(ControlStr
 /// answered with [`HelloReply::Err`] and returned as an error; any other reply is up to the
 /// caller.
 pub async fn accept_hello(conn: &Connection) -> Result<(ControlStream, Hello)> {
-    with_timeout(async {
+    with_timeout(HANDSHAKE_TIMEOUT, async {
         let mut control = ControlStream::accept(conn).await?;
         let hello: Hello = control.recv().await?;
         if hello.version != PROTOCOL_VERSION {
@@ -99,8 +118,8 @@ pub async fn accept_hello(conn: &Connection) -> Result<(ControlStream, Hello)> {
     .await
 }
 
-async fn with_timeout<T>(fut: impl Future<Output = Result<T>>) -> Result<T> {
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, fut)
+async fn with_timeout<T>(timeout: Duration, fut: impl Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(timeout, fut)
         .await
         .map_err(|_| Error::HandshakeTimeout)?
 }

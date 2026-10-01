@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 magictunnel-common.workspace = true
 magictunnel-transport.workspace = true
+magictunnel-tunio.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 tun-rs.workspace = true

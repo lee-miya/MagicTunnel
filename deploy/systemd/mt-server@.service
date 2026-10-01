@@ -1,0 +1,25 @@
+# magicTunnel exit node (also relays). Config: /etc/magictunnel/%i.toml
+#   systemctl enable --now mt-server@exit1
+[Unit]
+Description=magicTunnel exit node %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mt-server -c /etc/magictunnel/%i.toml
+Restart=on-failure
+RestartSec=2
+# Gives the process time to remove its iptables rules and TUN.
+TimeoutStopSec=15
+# Root for /run/xtables.lock and /proc/sys/net/ipv4/ip_forward, but only the capabilities a
+# TUN and iptables need.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

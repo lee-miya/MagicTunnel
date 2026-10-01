@@ -1,0 +1,28 @@
+# magicTunnel pure relay (config without [exit]). Config: /etc/magictunnel/%i.toml
+#   systemctl enable --now mt-relay@relay1
+# Certificates and key must be readable by the dynamic user, e.g. group-readable by a group
+# listed in SupplementaryGroups=, or copied in with LoadCredential=.
+[Unit]
+Description=magicTunnel relay %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mt-server -c /etc/magictunnel/%i.toml
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

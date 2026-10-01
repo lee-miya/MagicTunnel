@@ -3,3 +3,4 @@
 *.key
 /.cursor/
 AGENTS.md
+/dist

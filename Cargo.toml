@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/common",
     "crates/transport",
+    "crates/tunio",
     "crates/client",
     "crates/server",
     "xtask",
@@ -18,6 +19,7 @@ publish = false
 # internal crates
 magictunnel-common = { path = "crates/common" }
 magictunnel-transport = { path = "crates/transport" }
+magictunnel-tunio = { path = "crates/tunio" }
 
 # async runtime / bytes
 tokio = { version = "1.53", features = ["full"] }
@@ -30,6 +32,9 @@ rustls-pki-types = { version = "1.15", features = ["std"] }
 
 # TUN
 tun-rs = { version = "2.8", features = ["async"] }
+
+# Windows route management (same version tun-rs uses)
+windows-sys = "0.61"
 
 # config / serialization
 serde = { version = "1.0", features = ["derive"] }

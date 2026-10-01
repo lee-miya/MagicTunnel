@@ -701,9 +701,14 @@ dependencies = [
  "ipnet",
  "magictunnel-common",
  "magictunnel-transport",
+ "magictunnel-tunio",
+ "serde",
+ "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
  "tun-rs",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -713,7 +718,9 @@ dependencies = [
  "ipnet",
  "rustls-pki-types",
  "serde",
+ "serde_json",
  "thiserror",
+ "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -729,6 +736,7 @@ dependencies = [
  "ipnet",
  "magictunnel-common",
  "magictunnel-transport",
+ "magictunnel-tunio",
  "tokio",
  "tracing",
  "tun-rs",
@@ -749,6 +757,15 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "magictunnel-tunio"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "tracing",
+ "tun-rs",
 ]
 
 [[package]]

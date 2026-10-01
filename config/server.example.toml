@@ -11,10 +11,26 @@ key = "certs/exit1.key"
 [obfs]
 xor_key = "change-me-to-a-long-random-string"
 
-# Omit this section on pure relay nodes.
+# QUIC settings of every link this node accepts or dials (see client.example.toml).
+# [quic]
+# keepalive_secs = 10
+# idle_timeout_secs = 30
+# congestion = "cubic"
+
+# [metrics]
+# listen = "127.0.0.1:9100"
+# log_interval_secs = 0
+
+# Omit this section on pure relay nodes (see relay.example.toml). A node with it is the exit
+# for routes ending here and still relays routes that continue past it.
 [exit]
 pool = "10.88.0.0/24"
 
 [exit.tun]
 name = "mt0"
 mtu = 1200
+# Linux: exchange TSO/GRO super-packets with the kernel.
+# offload = true
+# Multi-queue TUN: the kernel spreads flows over the queues, each read by its own task.
+# 0 means one per CPU.
+# queues = 0

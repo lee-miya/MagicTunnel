@@ -1,0 +1,23 @@
+# magicTunnel Linux client. Config: /etc/magictunnel/client.toml
+#   systemctl enable --now mt-client
+# The client reconnects on its own; Restart= only covers a failed first connection.
+[Unit]
+Description=magicTunnel client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mt-client -c /etc/magictunnel/client.toml
+Restart=on-failure
+RestartSec=5
+# Gives the process time to restore routes and remove the TUN.
+TimeoutStopSec=15
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

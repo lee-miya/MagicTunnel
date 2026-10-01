@@ -13,10 +13,22 @@ path = "src/main.rs"
 [dependencies]
 magictunnel-common.workspace = true
 magictunnel-transport.workspace = true
+magictunnel-tunio.workspace = true
 tokio.workspace = true
 bytes.workspace = true
 tun-rs.workspace = true
 ipnet.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
