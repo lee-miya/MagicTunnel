@@ -57,7 +57,7 @@ make TARGET=x86_64-unknown-linux-gnu          # 动态链接，要求 glibc ≥ 
 make dist TARGET=x86_64-unknown-linux-musl    # 全静态，任意发行版可用
 ```
 
-已设置 `CC_<triple>` / `CARGO_TARGET_<TRIPLE>_LINKER` 时以它们为准。
+已设置 `CC_<triple>` / `CARGO_TARGET_<TRIPLE>_LINKER` 时以它们为准。同架构的 musl 目标（如 x86_64 主机上 `make TARGET=x86_64-unknown-linux-musl`）没有 zig 也行，直接用系统 `cc`。
 
 1. 出口节点（需要 root 或 `CAP_NET_ADMIN`，PATH 里要有 `iptables`）：`make config` 选“出口”，或以 `config/server.example.toml` 为模板，`sudo mt-server -c exit1.toml`。
 2. 可选的中继节点（无需特权）：`make config` 选“中继”，或以 `config/relay.example.toml` 为模板，`mt-server -c relay1.toml`。

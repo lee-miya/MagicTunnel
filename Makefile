@@ -39,9 +39,12 @@ BINS    ?= $(if $(findstring linux,$(TRIPLE)),mt-server mt-client,mt-client)
 # Cross builds to another Linux triple use `zig cc` (scripts/zig/) as ring's C compiler and as
 # the linker, unless CC_<triple> / CARGO_TARGET_<TRIPLE>_LINKER are already set.
 # gnu targets link against ZIG_GLIBC's symbol versions, so the binary runs on that glibc or newer.
+# Without zig, a same-CPU target (e.g. musl on a gnu host) builds with the system cc (and rustc's
+# bundled musl startup files and libc).
 ZIG       ?= $(shell command -v zig 2>/dev/null)
 ZIG_GLIBC ?= 2.17
 CROSS_LINUX := $(if $(and $(TARGET),$(findstring -linux-,$(TARGET))),$(filter-out $(HOST),$(TARGET)))
+CROSS_ARCH  := $(if $(CROSS_LINUX),$(filter-out $(firstword $(subst -, ,$(HOST))),$(firstword $(subst -, ,$(TARGET)))))
 TARGET_ENV  := $(subst -,_,$(TARGET))
 TARGET_ENV_UPPER := $(shell echo '$(TARGET_ENV)' | tr a-z A-Z)
 ifneq ($(and $(CROSS_LINUX),$(ZIG)),)
@@ -51,6 +54,10 @@ export MT_ZIG_TARGET := $(firstword $(subst -, ,$(TARGET)))-linux-$(ZIG_ABI)$(if
 export CC_$(TARGET_ENV) ?= $(CURDIR)/scripts/zig/cc
 export AR_$(TARGET_ENV) ?= $(CURDIR)/scripts/zig/ar
 export CARGO_TARGET_$(TARGET_ENV_UPPER)_LINKER ?= $(CURDIR)/scripts/zig/cc
+else ifneq ($(and $(CROSS_LINUX),$(if $(CROSS_ARCH),,same)),)
+# cc-rs would insist on <arch>-linux-musl-gcc / musl-gcc; ring's C code builds fine with the host cc.
+export CC_$(TARGET_ENV) ?= cc
+export AR_$(TARGET_ENV) ?= ar
 endif
 
 # ---- install -------------------------------------------------------------------------------
@@ -90,7 +97,7 @@ build: ## (default) Build mt-server/mt-client; PROFILE=dev for debug, TARGET=<tr
 	    && ! rustup target list --installed | grep -qx '$(TARGET)'; then \
 	  echo "Rust target $(TARGET) is not installed: rustup target add $(TARGET)" >&2; exit 1; \
 	fi
-	@if [[ -n "$(CROSS_LINUX)" && -z "$(ZIG)" && -z "$${CARGO_TARGET_$(TARGET_ENV_UPPER)_LINKER:-}" ]]; then \
+	@if [[ -n "$(CROSS_ARCH)" && -z "$(ZIG)" && -z "$${CARGO_TARGET_$(TARGET_ENV_UPPER)_LINKER:-}" ]]; then \
 	  echo "Cross-compiling to $(TARGET) needs a linker: install zig (or pass ZIG=/path/to/zig)," >&2; \
 	  echo "or set CC_$(TARGET_ENV) and CARGO_TARGET_$(TARGET_ENV_UPPER)_LINKER." >&2; exit 1; \
 	fi
