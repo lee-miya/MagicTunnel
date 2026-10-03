@@ -37,7 +37,15 @@ flowchart LR
 
 ## 快速开始
 
-需要 Rust（edition 2024，rustc ≥ 1.85）。
+先准备编译环境（Linux：apt/dnf/yum/pacman/apk；macOS：Xcode Command Line Tools + Homebrew）：
+
+```bash
+scripts/setup-toolchain.sh --check            # 只检查缺什么（= make doctor），不安装
+scripts/setup-toolchain.sh                    # 安装：C 编译器、GNU make、curl 等系统包（sudo 前会确认），
+                                              # rustup + rust-toolchain.toml 固定的 Rust 版本与 clippy/rustfmt
+```
+
+脚本可重复执行，已有的会跳过；也可用 `make setup`（需要已有 make 和 bash，全新机器先直接跑脚本）。选项：`--target <triple>`（可多次）装对应 rustup target，跨 CPU 架构的 Linux 目标（或在 macOS 上编 Linux）另装固定版本的 zig 到 `~/.local/share/magictunnel/zig`；`--e2e` 装端到端测试工具并检查 `/dev/net/tun`、非特权用户命名空间；`--yes` 不询问。不改 shell 配置文件：Makefile 自己去 `~/.cargo/bin` 和上面的 zig 目录找工具。Rust 版本由 `rust-toolchain.toml` 固定（下限 1.85，edition 2024），rustup 在仓库内会自动使用它。
 
 ```bash
 make                                          # = cargo build --release，产物 target/release/{mt-server,mt-client}
@@ -49,10 +57,10 @@ make config                                   # 交互式生成客户端/出口/
 
 `make help` 列出全部目标：`test`/`clippy`/`ci`、`e2e*`、`perf`、`install`（`PREFIX`/`DESTDIR`/`CONFDIR` 可改）、`dist`（打包成 `dist/magictunnel-<版本>-<target>.tar.gz`，`TARGET=<triple>` 交叉编译）、`cross-check` 等。
 
-交叉编译 Linux 目标（如在 ARM 机器上出 x86_64 二进制）用 [zig](https://ziglang.org/download/) 当 C 编译器和链接器，Makefile 自动接好（zig 不在 PATH 上时传 `ZIG=/path/to/zig`）：
+交叉编译 Linux 目标（如在 ARM 机器上出 x86_64 二进制）用 [zig](https://ziglang.org/download/) 当 C 编译器和链接器，Makefile 自动接好（优先用 `make setup` 装的 zig，其次 PATH 上的，也可传 `ZIG=/path/to/zig`）：
 
 ```bash
-rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
+make setup TARGET="x86_64-unknown-linux-gnu x86_64-unknown-linux-musl"
 make TARGET=x86_64-unknown-linux-gnu          # 动态链接，要求 glibc ≥ 2.17（ZIG_GLIBC 可改）
 make dist TARGET=x86_64-unknown-linux-musl    # 全静态，任意发行版可用
 ```

@@ -13,12 +13,13 @@
 ## 2. 安装
 
 ```bash
+scripts/setup-toolchain.sh   # 首次：装编译工具链（见 README「快速开始」）
 make                  # 以普通用户构建
 sudo make install     # 二进制到 /usr/local/bin，示例配置与 certs/ 目录到 /etc/magictunnel，
                       # systemd 单元到 /etc/systemd/system，sysctl 到 /etc/sysctl.d
 ```
 
-`PREFIX=/usr`、`CONFDIR=...` 会同步改写单元文件里的路径；`DESTDIR=/tmp/pkg` 用于打包暂存。`sudo make uninstall` 删除上述文件但保留 `/etc/magictunnel`（里面有配置和私钥）。要拷到别的机器，用 `make dist`（可加 `TARGET=x86_64-unknown-linux-musl` 交叉编译出全静态二进制，需 zig，见 README）生成带二进制、配置示例、`deploy/`、文档的 tar 包。
+`PREFIX=/usr`、`CONFDIR=...` 会同步改写单元文件里的路径；`DESTDIR=/tmp/pkg` 用于打包暂存。`sudo make uninstall` 删除上述文件但保留 `/etc/magictunnel`（里面有配置和私钥）。要拷到别的机器，用 `make dist`（可加 `TARGET=x86_64-unknown-linux-musl` 交叉编译出全静态二进制，先 `make setup TARGET=x86_64-unknown-linux-musl`，见 README）生成带二进制、配置示例、`deploy/`、文档的 tar 包。
 
 ## 3. 证书与密钥
 
