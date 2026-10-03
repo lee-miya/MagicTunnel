@@ -92,6 +92,8 @@ journalctl -u mt-server@exit1 -f
 
 断线时（默认开启重连）客户端保留 TUN 和路由，流量等待隧道恢复而不会走物理网卡；SIGINT/SIGTERM（重连中也一样）会恢复路由并删除 TUN 后退出。
 
+DNS：默认不动系统 DNS，本机解析器若是局域网地址（如路由器 `192.168.1.1`），DNS 查询会绕过隧道。配置 `[dns] servers = ["1.1.1.1"]` 后客户端在隧道建立时接管系统 DNS、退出时恢复（各平台做法见 [配置参考](configuration.md#dns)）。systemd 单元为此用 `ProtectSystem=true`（`/etc` 可写）和 `StateDirectory=magictunnel`；若沿用旧单元的 `ProtectSystem=full`，改写 `/etc/resolv.conf` 会失败（systemd-resolved 主机不受影响）。
+
 ## 6. 监控
 
 在 `[metrics]` 里设 `listen = "127.0.0.1:9100"`，Prometheus 抓 `http://<节点>:9100/metrics`。端点是明文、无认证的，只应暴露在回环或管理网段上（例如通过 SSH 隧道或 node_exporter 所在的内网）。
@@ -150,6 +152,9 @@ scrape_configs:
 | 能 ping 不能上网 | 出口 `iptables` 规则被别的防火墙冲掉；`iptables-save | grep magictunnel` 应有 3 条。 |
 | 大包或 HTTPS 卡住 | 路径 MTU 太小：确认路径能承载 1312 字节的 UDP 报文；若 `tun.mtu` 设得比 1200 大，可以改回 1200。`magictunnel_dropped_packets_total{reason="too_large"}` 会持续增长。 |
 | `exit TUN up ... offload=false` | 内核不支持 TUN offload，已自动退回逐包模式。 |
+| 客户端 `taking over system DNS: ... Read-only file system` | systemd 单元仍是 `ProtectSystem=full`，换用新版 `deploy/systemd/mt-client.service`。 |
+| 客户端日志反复 `overwritten by another program; tunnel DNS re-applied` | NetworkManager 等在频繁改写 `/etc/resolv.conf`。可让它不管 resolv.conf（NetworkManager：`[main] dns=none`），或改用 systemd-resolved。 |
+| 客户端被强杀后 DNS 不通 | 下次启动 `mt-client` 会自动恢复；不想再启动时，Linux 下原文件在 `/var/lib/magictunnel/resolv-conf.json` 的 `original` 字段，macOS 用 `networksetup -setdnsservers <服务名> Empty` 恢复为 DHCP。 |
 | `/lib64/libc.so.6: version 'GLIBC_2.xx' not found` | 二进制是不带 `TARGET` 的 `make`（或 `cargo build`）编的，链接了编译机较新的 glibc。用 `make TARGET=x86_64-unknown-linux-gnu`（glibc ≥ 2.17）或 `TARGET=x86_64-unknown-linux-musl`（全静态）重新编译。 |
 
 ## 10. 安全说明

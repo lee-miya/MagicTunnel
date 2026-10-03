@@ -8,8 +8,10 @@ use std::process::Command;
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use super::ledger::Ledger;
+use crate::ledger::Ledger;
 use crate::tun::Tun;
+
+const LEDGER: &str = "magictunnel-client-route.json";
 
 pub struct Routes {
     tun: String,
@@ -45,7 +47,7 @@ impl Bypass {
 
 impl Routes {
     pub fn new(tun: &Tun) -> anyhow::Result<Self> {
-        let ledger = Ledger::system();
+        let ledger = Ledger::runtime(LEDGER);
         if let Some(stale) = ledger.take::<Bypass>() {
             match route("delete", &stale.args()) {
                 Ok(_) => {

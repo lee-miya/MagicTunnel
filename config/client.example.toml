@@ -41,6 +41,12 @@ mtu = 1200
 # Log a traffic summary every N seconds; 0 disables it.
 # log_interval_secs = 0
 
+[dns]
+# While the tunnel is up the system resolves through these (at most 3, IPv4) and the queries
+# leave from the exit; the previous DNS settings return when the client stops. Unset or
+# empty leaves system DNS alone, like WireGuard without DNS =.
+# servers = ["1.1.1.1", "8.8.8.8"]
+
 # Full path, first hop first. The last hop is the exit node.
 [[route]]
 addr = "192.0.2.10:4433"

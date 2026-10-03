@@ -59,6 +59,21 @@
 | `listen` | 不启用 | 例如 `"127.0.0.1:9100"`，提供 `GET /metrics`（Prometheus 文本格式）。明文 HTTP、无认证，只应监听回环或内网地址。启动时端口被占用会报错。 |
 | `log_interval_secs` | `0`（关闭） | 每隔 N 秒以 info 级别记一行 `stats`：上下行速率、RTT、丢包、重连次数。 |
 
+### `[dns]`
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `servers` | 空（不改系统 DNS） | 例如 `["1.1.1.1", "8.8.8.8"]`，至多 3 个 IPv4 单播地址（隧道只承载 IPv4）。隧道建立后系统改用这些 DNS 服务器，查询经隧道从出口发出；客户端退出（含出错退出）时恢复原设置。断线重连期间保持不变，查询进 TUN 等待，不会落到本地网络的 DNS。作用类似 WireGuard 的 `DNS =`。 |
+
+各平台做法：
+
+- **Linux，`/etc/resolv.conf` 由 systemd-resolved 管理**（其中是 `nameserver 127.0.0.53`）：用 `resolvectl` 把服务器设到 TUN 链路上，并加路由域 `~.`，所有查询都发往 TUN 上的服务器（其他链路只保留各自更具体的域，如 DHCP 下发的 `lan`）。这些设置随 TUN 消失，进程被杀也不残留。
+- **Linux，其他情况**（静态文件、NetworkManager 写的文件或指向它的符号链接）：改写 `/etc/resolv.conf`，只留配置的 `nameserver`，保留原文件的 `search`/`domain`/`options` 行。原文件（或符号链接）先存到 `/var/lib/magictunnel/resolv-conf.json` 再改写，退出时原样放回；被 `kill -9` 或断电后，下次启动先恢复再接管。普通文件就地写入（保留属主权限，容器里 bind mount 的 resolv.conf 也能用），符号链接则替换为普通文件、退出时还原链接。运行期间每 2 秒检查一次：若被 NetworkManager/dhclient 等改写，重新写回隧道版本，并把对方写的内容当作退出时要恢复的原件。退出时若文件已不是隧道写的版本，则不动它。
+- **macOS**：`networksetup -setdnsservers` 设置到所有网络服务（含停用的），原设置（含"使用 DHCP 下发"）存到 `/Library/Application Support/magicTunnel/client-dns.json`，退出或下次启动时恢复，并刷新 DNS 缓存。
+- **Windows**：`netsh` 把服务器设到 Wintun 适配器，并把该适配器的接口跃点数设为 0，系统 DNS 客户端优先问它；这些设置随适配器删除。注意 Windows 在首选适配器的服务器迟迟不回时会再问其他适配器的服务器（例如重连期间），程序没有用防火墙（WFP）封堵其他网卡的 53 端口，严格防泄漏需自行加规则。
+
+DNS 服务器地址本身须经隧道路由：本地网段内的地址（如 `192.168.1.1`）走直连路由，查询不进隧道。
+
 ### `[[route]]`（至少 1 个，至多 8 个）
 
 | 键 | 说明 |

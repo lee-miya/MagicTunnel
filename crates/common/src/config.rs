@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use ipnet::Ipv4Net;
@@ -19,6 +19,8 @@ pub const DEFAULT_TUN_MTU: u16 = 1200;
 const MAX_IDLE_TIMEOUT_SECS: u64 = 600;
 /// Linux's own limit on TUN queues is 256; beyond a few per core there is nothing to gain.
 const MAX_TUN_QUEUES: usize = 64;
+/// glibc's resolver ignores nameservers past the third.
+pub const MAX_DNS_SERVERS: usize = 3;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -170,6 +172,38 @@ impl Default for ReconnectConfig {
     }
 }
 
+/// Client DNS takeover.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsConfig {
+    /// While the tunnel is up the system resolves through these, and the route takeover
+    /// carries the queries through the tunnel; the previous settings return when the client
+    /// stops. IPv4 only, like the tunnel. Empty leaves system DNS alone.
+    #[serde(default)]
+    pub servers: Vec<Ipv4Addr>,
+}
+
+impl DnsConfig {
+    fn validate(&self) -> Result<()> {
+        if self.servers.len() > MAX_DNS_SERVERS {
+            return Err(Error::InvalidConfig(format!(
+                "dns.servers has {} entries, at most {MAX_DNS_SERVERS} are allowed",
+                self.servers.len()
+            )));
+        }
+        if let Some(bad) = self
+            .servers
+            .iter()
+            .find(|ip| ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast())
+        {
+            return Err(Error::InvalidConfig(format!(
+                "dns.servers: {bad} is not a unicast address"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
@@ -185,6 +219,8 @@ pub struct ClientConfig {
     pub reconnect: ReconnectConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub dns: DnsConfig,
     /// Full path chosen by the client, first hop first; the last hop is the exit.
     #[serde(rename = "route")]
     pub route: Vec<HopConfig>,
@@ -211,6 +247,7 @@ impl ClientConfig {
         }
         validate_obfs(&cfg.obfs)?;
         cfg.quic.validate()?;
+        cfg.dns.validate()?;
         Ok(cfg)
     }
 }
@@ -379,10 +416,11 @@ mod tests {
                           [[route]]\naddr = \"192.0.2.1:4433\"\nserver_name = \"exit1\"\n";
 
     fn load_client(extra: &str) -> Result<ClientConfig> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
             "mt-config-test-{}-{}",
             std::process::id(),
-            extra.len()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("client.toml");
@@ -433,5 +471,28 @@ mod tests {
             assert!(load_client(&format!("[quic]\n{quic}\n")).is_err(), "{quic}");
         }
         assert!(load_client("[reconnect]\nmax_delay_secs = 0\n").is_err());
+    }
+
+    #[test]
+    fn parses_dns_servers() {
+        assert!(load_client("").unwrap().dns.servers.is_empty());
+        let cfg = load_client("[dns]\nservers = [\"1.1.1.1\", \"8.8.8.8\"]\n").unwrap();
+        assert_eq!(
+            cfg.dns.servers,
+            [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)]
+        );
+        for bad in [
+            "[\"1.1.1.1\", \"1.0.0.1\", \"8.8.8.8\", \"8.8.4.4\"]",
+            "[\"0.0.0.0\"]",
+            "[\"255.255.255.255\"]",
+            "[\"224.0.0.251\"]",
+            "[\"2606:4700::1111\"]",
+            "[\"dns.example\"]",
+        ] {
+            assert!(
+                load_client(&format!("[dns]\nservers = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
     }
 }

@@ -16,8 +16,10 @@ use windows_sys::Win32::Networking::WinSock::{
     AF_INET, MIB_IPPROTO_NETMGMT, NlroManual, SOCKADDR_INET,
 };
 
-use super::ledger::Ledger;
+use crate::ledger::Ledger;
 use crate::tun::Tun;
+
+const LEDGER: &str = "magictunnel-client-route.json";
 
 pub struct Routes {
     tun: String,
@@ -68,7 +70,7 @@ impl Route {
 
 impl Routes {
     pub fn new(tun: &Tun) -> anyhow::Result<Self> {
-        let ledger = Ledger::system();
+        let ledger = Ledger::runtime(LEDGER);
         if let Some(stale) = ledger.take::<Route>() {
             match stale.delete() {
                 Ok(()) => {

@@ -80,9 +80,12 @@ our_routes() { ns "$1" ip -4 route show proto 233 | wc -l; }
 nat_rules() { ns "$1" iptables-save | grep -c 'magictunnel:' || true; }
 ip_forward() { ns "$1" cat /proc/sys/net/ipv4/ip_forward; }
 
-# start_web NS: the fake public host, serving /whoami, /blob and UDP echo on $WEB.
+# resolve NS NAME: first IPv4 address the system resolver returns for NAME.
+resolve() { ns "$1" getent ahostsv4 "$2" | awk 'NR == 1 { print $1 }'; }
+
+# start_web NS: the fake public host, serving /whoami, /blob, UDP echo and DNS on $WEB.
 start_web() {
-  nsenter -t "${NS[$1]}" -n python3 "$HERE/web.py" "$WEB" 8080 5353 blob 2>web.log &
+  nsenter -t "${NS[$1]}" -n python3 "$HERE/web.py" "$WEB" 8080 5353 blob 53 2>web.log &
   BG+=($!)
   local i
   for ((i = 0; i < 50; i++)); do ns "$1" curl -s -o /dev/null "http://$WEB:8080/whoami" && return; sleep 0.1; done

@@ -1,6 +1,6 @@
-//! On-disk record of the first-hop bypass route, for platforms that cannot tag routes the way
-//! Linux does with `proto`. It is written once the route is added and removed once it is
-//! deleted, so a run that dies in between leaves a record the next start uses to delete it.
+//! On-disk record of a system change that would outlive a crash. It is written once the
+//! change is made and removed once it is undone, so a run that dies in between leaves a
+//! record the next start uses to undo it.
 
 use std::path::{Path, PathBuf};
 use std::{fs, io};
@@ -8,15 +8,21 @@ use std::{fs, io};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-const FILE_NAME: &str = "magictunnel-client-route.json";
-
 pub struct Ledger {
     path: PathBuf,
 }
 
 impl Ledger {
-    pub fn system() -> Self {
-        Self::at(system_dir().join(FILE_NAME))
+    /// For changes that do not survive a reboot either; on macOS the record goes with them.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    pub fn runtime(name: &str) -> Self {
+        Self::at(runtime_dir().join(name))
+    }
+
+    /// For changes that persist across reboots.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn persistent(name: &str) -> Self {
+        Self::at(persistent_dir().join(name))
     }
 
     pub fn at(path: PathBuf) -> Self {
@@ -27,50 +33,58 @@ impl Ledger {
         &self.path
     }
 
-    /// Returns the recorded route, if any, and forgets it.
+    /// Returns the recorded change, if any, and forgets it.
     pub fn take<T: DeserializeOwned>(&self) -> Option<T> {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
             Err(e) => {
-                tracing::warn!(path = %self.path.display(), "cannot read route record: {e}");
+                tracing::warn!(path = %self.path.display(), "cannot read record: {e}");
                 return None;
             }
         };
         self.clear();
         serde_json::from_str(&text)
-            .inspect_err(|e| {
-                tracing::warn!(path = %self.path.display(), "ignoring corrupt route record: {e}")
-            })
+            .inspect_err(
+                |e| tracing::warn!(path = %self.path.display(), "ignoring corrupt record: {e}"),
+            )
             .ok()
     }
 
-    pub fn record<T: Serialize>(&self, route: &T) -> io::Result<()> {
+    pub fn record<T: Serialize>(&self, change: &T) -> io::Result<()> {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
         }
-        fs::write(&self.path, serde_json::to_vec(route)?)
+        fs::write(&self.path, serde_json::to_vec(change)?)
     }
 
     pub fn clear(&self) {
         match fs::remove_file(&self.path) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(path = %self.path.display(), "cannot remove route record: {e}")
-            }
+            Err(e) => tracing::warn!(path = %self.path.display(), "cannot remove record: {e}"),
         }
     }
 }
 
-/// Cleared at boot on macOS, matching the lifetime of the routes it describes.
+/// Cleared at boot on macOS.
 #[cfg(target_os = "macos")]
-fn system_dir() -> PathBuf {
+fn runtime_dir() -> PathBuf {
     PathBuf::from("/var/run")
 }
 
+#[cfg(target_os = "macos")]
+fn persistent_dir() -> PathBuf {
+    PathBuf::from("/Library/Application Support/magicTunnel")
+}
+
 #[cfg(windows)]
-fn system_dir() -> PathBuf {
+fn runtime_dir() -> PathBuf {
+    persistent_dir()
+}
+
+#[cfg(windows)]
+fn persistent_dir() -> PathBuf {
     std::env::var_os("ProgramData")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -78,8 +92,14 @@ fn system_dir() -> PathBuf {
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn system_dir() -> PathBuf {
+fn runtime_dir() -> PathBuf {
     std::env::temp_dir()
+}
+
+/// The systemd unit's `StateDirectory`.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn persistent_dir() -> PathBuf {
+    PathBuf::from("/var/lib/magictunnel")
 }
 
 #[cfg(test)]
@@ -91,7 +111,7 @@ mod tests {
     #[test]
     fn records_and_takes_once() {
         let dir = std::env::temp_dir().join(format!("mt-ledger-test-{}", std::process::id()));
-        let ledger = Ledger::at(dir.join("nested").join(FILE_NAME));
+        let ledger = Ledger::at(dir.join("nested").join("record.json"));
         assert_eq!(ledger.take::<Ipv4Addr>(), None);
 
         let hop = Ipv4Addr::new(203, 0, 113, 7);

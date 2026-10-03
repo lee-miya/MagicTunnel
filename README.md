@@ -15,6 +15,7 @@ flowchart LR
 - **加密与认证**：TLS 1.3 双向证书（mTLS），每一跳都校验对端证书与名字。
 - **混淆**：UDP 层 XOR（每个 UDP 报文带随机 nonce），线上看不到 QUIC 特征。它只是抗 DPI，**不是加密**，机密性由 TLS 保证。
 - **多跳**：客户端在配置里写出整条路径（最多 8 跳）；每跳独立的 QUIC + mTLS + XOR 会话，节点只知道相邻两跳。
+- **DNS 接管**（可选，类似 WireGuard 的 `DNS =`）：`[dns] servers` 让系统在隧道期间改用指定 DNS（查询经隧道从出口发出），退出时恢复；Linux 支持 systemd-resolved 与直接改写 `/etc/resolv.conf`（被强杀后下次启动自动恢复），macOS 用 `networksetup`，Windows 设到 Wintun 适配器。
 - **平台**：服务端 Linux；客户端 Linux（已实测），macOS / Windows（已实现、尚未真机验证）。
 
 ## 稳定性与性能（阶段 4）
@@ -72,7 +73,7 @@ make dist TARGET=x86_64-unknown-linux-musl    # 全静态，任意发行版可�
 3. 客户端（需要 root / 管理员）：`make config` 选“客户端”并按顺序填写路径，或以 `config/client.example.toml` 为模板写好 `[[route]]`，`sudo mt-client -c client1.toml`。
 4. 所有节点的 `obfs.xor_key` 必须一致，证书须由同一个 CA 签发，`server_name` 须与对端证书的 SAN 一致。
 
-Ctrl-C / SIGTERM 时客户端会先删路由再删 TUN，把机器恢复原样；被 `kill -9` 后，下次启动会清掉残留路由。
+Ctrl-C / SIGTERM 时客户端会依次恢复 DNS（若配置了 `[dns]`）、删路由、删 TUN，把机器恢复原样；被 `kill -9` 后，下次启动会清掉残留路由并恢复 DNS。
 
 ## 文档
 
@@ -86,7 +87,7 @@ Ctrl-C / SIGTERM 时客户端会先删路由再删 TUN，把机器恢复原样�
 | `crates/common` | 配置、握手协议、IPv4/ICMP 辅助、指标、日志、证书加载 |
 | `crates/transport` | QUIC 端点、mTLS、XOR 混淆 socket、控制流、datagram 收发与中继 |
 | `crates/tunio` | 批量 TUN 读写（Linux offload：TSO 拆分 / GRO 合并） |
-| `crates/client` | `mt-client`：会话与重连、TUN、路由接管（Linux/macOS/Windows）、数据泵 |
+| `crates/client` | `mt-client`：会话与重连、TUN、路由与 DNS 接管（Linux/macOS/Windows）、数据泵 |
 | `crates/server` | `mt-server`：中继、出口（地址池、会话表、多队列 TUN、iptables NAT） |
 | `xtask` | `cargo xtask gen-certs`：开发证书 |
 | `deploy/` | systemd 单元、sysctl 示例 |
@@ -96,11 +97,11 @@ Ctrl-C / SIGTERM 时客户端会先删路由再删 TUN，把机器恢复原样�
 
 ```bash
 make test             # 单元测试 + loopback QUIC 测试（make ci 另加 fmt 检查与 clippy -D warnings）
-make e2e-single       # 单跳：路由接管、NAT、mTLS/XOR 拒绝、线上无 QUIC 特征（约 20s）
+make e2e-single       # 单跳：路由与 DNS 接管/恢复、NAT、mTLS/XOR 拒绝、线上无 QUIC 特征（约 25s）
 make e2e-multi        # 2/3/8 跳、逐跳隔离、失败原因回传（约 30s）
 make e2e-resilience   # 重连、断线期间不泄漏、TCP 长连接存活、指标、PMTU/ICMP（约 35s）
 make e2e              # 以上三项
 make perf             # release 构建后测吞吐与负载下延迟
 ```
 
-e2e 脚本在 `unshare -Urn` 建的私有网络命名空间里运行，不需要 root，但需要 `/dev/net/tun`、`iptables`、`python3`、`curl`；`perf.sh` 的 `SHAPE="50mbit 10ms"` 用 `tc netem` 模拟慢速上行。
+e2e 脚本在 `unshare -Urn` 建的私有网络命名空间里运行（单跳脚本另加私有挂载命名空间，用 bind mount 的测试文件代替 `/etc/resolv.conf`，不碰本机 DNS），不需要 root，但需要 `/dev/net/tun`、`iptables`、`python3`、`curl`；`perf.sh` 的 `SHAPE="50mbit 10ms"` 用 `tc netem` 模拟慢速上行。

@@ -6,10 +6,7 @@
 //! first-hop bypass route can outlive a crash; every backend removes such leftovers on the
 //! next start.
 
-// The ledger and the macOS backend are portable, so their tests run on every platform.
-#[cfg(any(target_os = "macos", windows, test))]
-#[cfg_attr(target_os = "linux", allow(dead_code))]
-mod ledger;
+// The macOS backend is portable, so its tests run on every platform.
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(any(target_os = "macos", test))]

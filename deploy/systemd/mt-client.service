@@ -15,7 +15,10 @@ TimeoutStopSec=15
 CapabilityBoundingSet=CAP_NET_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN
 NoNewPrivileges=yes
-ProtectSystem=full
+# Not "full": [dns] servers may rewrite /etc/resolv.conf, keeping the original in the state
+# directory /var/lib/magictunnel until it is restored.
+ProtectSystem=true
+StateDirectory=magictunnel
 ProtectHome=yes
 PrivateTmp=yes
 

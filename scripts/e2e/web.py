@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Fake public host for the e2e tests: reports the source address it sees.
 
-    web.py ADDR HTTP_PORT UDP_PORT BLOB
+    web.py ADDR HTTP_PORT UDP_PORT BLOB [DNS_PORT]
 
 HTTP `GET /whoami...` returns the client IP, `GET /blob` returns the BLOB file. Every UDP
-datagram is answered with the sender's IP.
+datagram is answered with the sender's IP. With DNS_PORT, a DNS server answers every A query
+with the sender's IP too.
 """
 
 import socket
@@ -43,7 +44,27 @@ def main() -> None:
             udp.sendto(peer[0].encode(), peer)
 
     threading.Thread(target=echo, daemon=True).start()
+    if len(sys.argv) > 5:
+        threading.Thread(target=dns, args=(addr, int(sys.argv[5])), daemon=True).start()
     ThreadingHTTPServer((addr, http_port), Handler).serve_forever()
+
+
+def dns(addr: str, port: int) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((addr, port))
+    while True:
+        query, peer = sock.recvfrom(512)
+        end = 12
+        while query[end]:
+            end += query[end] + 1
+        question = query[12 : end + 5]
+        answer = b""
+        if question[-4:-2] == b"\x00\x01":  # QTYPE A
+            # Name pointer to the question, type A, class IN, TTL 0, 4-byte address.
+            answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x00\x00\x04" + socket.inet_aton(peer[0])
+        header = query[:2] + b"\x81\x80\x00\x01" + (b"\x00\x01" if answer else b"\x00\x00") + b"\x00\x00\x00\x00"
+        sock.sendto(header + question + answer, peer)
+        sys.stderr.write(f"{peer[0]} DNS query\n")
 
 
 if __name__ == "__main__":

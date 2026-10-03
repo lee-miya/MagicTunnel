@@ -1,3 +1,5 @@
+mod dns;
+mod ledger;
 mod metrics;
 mod pump;
 mod route;
@@ -15,6 +17,7 @@ use magictunnel_common::metrics::MetricsServer;
 use magictunnel_common::proto::Resume;
 use magictunnel_common::{config::ClientConfig, logging};
 
+use crate::dns::DnsGuard;
 use crate::route::RouteGuard;
 use crate::session::Session;
 
@@ -61,8 +64,8 @@ async fn main() -> anyhow::Result<()> {
 
 /// Brings the tunnel up and pumps packets until shutdown, re-establishing the session when it
 /// fails. The TUN and routes stay in place while reconnecting, so traffic waits for the
-/// tunnel instead of leaking onto the physical network. Routes are restored and the TUN is
-/// removed on every exit path, in that order.
+/// tunnel instead of leaking onto the physical network. DNS and routes are restored and the
+/// TUN is removed on every exit path, in that order.
 async fn run(cfg: &ClientConfig, mut session: Session) -> anyhow::Result<()> {
     // Registered before touching the system so a signal can't skip the cleanup below.
     let mut shutdown = pin!(shutdown_signal().context("installing signal handlers")?);
@@ -84,6 +87,7 @@ async fn run(cfg: &ClientConfig, mut session: Session) -> anyhow::Result<()> {
         cfg.tun.offload,
     )?;
     let _routes = RouteGuard::install(&tun, cfg.route[0].addr)?;
+    let _dns = DnsGuard::install(&tun, &cfg.dns.servers)?;
     tracing::info!(
         tun = %tun.name,
         index = tun.index,
