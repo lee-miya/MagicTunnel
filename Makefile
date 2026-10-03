@@ -2,7 +2,8 @@
 #
 #   make                                     release build of mt-server + mt-client
 #   make PROFILE=dev                         debug build
-#   make dist TARGET=x86_64-unknown-linux-gnu
+#   make TARGET=x86_64-unknown-linux-gnu     cross build (links with zig; ZIG=/path/to/zig)
+#   make dist TARGET=x86_64-unknown-linux-musl
 #   sudo make install PREFIX=/usr            or DESTDIR=/tmp/pkg for staging
 #
 # Every variable below can be overridden on the command line or from the environment.
@@ -35,6 +36,23 @@ EXE     := $(if $(findstring windows,$(TRIPLE)),.exe)
 # mt-server is Linux-only; other platforms get just the client.
 BINS    ?= $(if $(findstring linux,$(TRIPLE)),mt-server mt-client,mt-client)
 
+# Cross builds to another Linux triple use `zig cc` (scripts/zig/) as ring's C compiler and as
+# the linker, unless CC_<triple> / CARGO_TARGET_<TRIPLE>_LINKER are already set.
+# gnu targets link against ZIG_GLIBC's symbol versions, so the binary runs on that glibc or newer.
+ZIG       ?= $(shell command -v zig 2>/dev/null)
+ZIG_GLIBC ?= 2.17
+CROSS_LINUX := $(if $(and $(TARGET),$(findstring -linux-,$(TARGET))),$(filter-out $(HOST),$(TARGET)))
+TARGET_ENV  := $(subst -,_,$(TARGET))
+TARGET_ENV_UPPER := $(shell echo '$(TARGET_ENV)' | tr a-z A-Z)
+ifneq ($(and $(CROSS_LINUX),$(ZIG)),)
+ZIG_ABI := $(lastword $(subst -, ,$(TARGET)))
+export MT_ZIG := $(abspath $(ZIG))
+export MT_ZIG_TARGET := $(firstword $(subst -, ,$(TARGET)))-linux-$(ZIG_ABI)$(if $(filter gnu%,$(ZIG_ABI)),.$(ZIG_GLIBC))
+export CC_$(TARGET_ENV) ?= $(CURDIR)/scripts/zig/cc
+export AR_$(TARGET_ENV) ?= $(CURDIR)/scripts/zig/ar
+export CARGO_TARGET_$(TARGET_ENV_UPPER)_LINKER ?= $(CURDIR)/scripts/zig/cc
+endif
+
 # ---- install -------------------------------------------------------------------------------
 
 PREFIX     ?= /usr/local
@@ -65,9 +83,17 @@ help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_-]+:.*## ' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN {FS = ":.*## "} {printf "  %-15s %s\n", $$1, $$2}'
 	@echo
-	@echo "Variables: PROFILE TARGET TARGET_DIR BINS PREFIX DESTDIR CONFDIR CERT_ARGS CROSS_TARGETS"
+	@echo "Variables: PROFILE TARGET TARGET_DIR BINS ZIG ZIG_GLIBC PREFIX DESTDIR CONFDIR CERT_ARGS CROSS_TARGETS"
 
 build: ## (default) Build mt-server/mt-client; PROFILE=dev for debug, TARGET=<triple> to cross
+	@if [[ -n "$(TARGET)" ]] && command -v rustup >/dev/null \
+	    && ! rustup target list --installed | grep -qx '$(TARGET)'; then \
+	  echo "Rust target $(TARGET) is not installed: rustup target add $(TARGET)" >&2; exit 1; \
+	fi
+	@if [[ -n "$(CROSS_LINUX)" && -z "$(ZIG)" && -z "$${CARGO_TARGET_$(TARGET_ENV_UPPER)_LINKER:-}" ]]; then \
+	  echo "Cross-compiling to $(TARGET) needs a linker: install zig (or pass ZIG=/path/to/zig)," >&2; \
+	  echo "or set CC_$(TARGET_ENV) and CARGO_TARGET_$(TARGET_ENV_UPPER)_LINKER." >&2; exit 1; \
+	fi
 	$(CARGO) build $(CARGO_FLAGS) $(addprefix --bin ,$(BINS))
 	@for b in $(BINS); do echo "  -> $(OUT_DIR)/$$b$(EXE)"; done
 

@@ -49,6 +49,16 @@ make config                                   # 交互式生成客户端/出口/
 
 `make help` 列出全部目标：`test`/`clippy`/`ci`、`e2e*`、`perf`、`install`（`PREFIX`/`DESTDIR`/`CONFDIR` 可改）、`dist`（打包成 `dist/magictunnel-<版本>-<target>.tar.gz`，`TARGET=<triple>` 交叉编译）、`cross-check` 等。
 
+交叉编译 Linux 目标（如在 ARM 机器上出 x86_64 二进制）用 [zig](https://ziglang.org/download/) 当 C 编译器和链接器，Makefile 自动接好（zig 不在 PATH 上时传 `ZIG=/path/to/zig`）：
+
+```bash
+rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl
+make TARGET=x86_64-unknown-linux-gnu          # 动态链接，要求 glibc ≥ 2.17（ZIG_GLIBC 可改）
+make dist TARGET=x86_64-unknown-linux-musl    # 全静态，任意发行版可用
+```
+
+已设置 `CC_<triple>` / `CARGO_TARGET_<TRIPLE>_LINKER` 时以它们为准。
+
 1. 出口节点（需要 root 或 `CAP_NET_ADMIN`，PATH 里要有 `iptables`）：`make config` 选“出口”，或以 `config/server.example.toml` 为模板，`sudo mt-server -c exit1.toml`。
 2. 可选的中继节点（无需特权）：`make config` 选“中继”，或以 `config/relay.example.toml` 为模板，`mt-server -c relay1.toml`。
 3. 客户端（需要 root / 管理员）：`make config` 选“客户端”并按顺序填写路径，或以 `config/client.example.toml` 为模板写好 `[[route]]`，`sudo mt-client -c client1.toml`。

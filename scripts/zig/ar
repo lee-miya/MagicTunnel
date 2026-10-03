@@ -1,0 +1,3 @@
+#!/bin/sh
+: "${MT_ZIG:?MT_ZIG not set (path to zig)}"
+exec "$MT_ZIG" ar "$@"
