@@ -38,28 +38,29 @@ EXE     := $(if $(findstring windows,$(TRIPLE)),.exe)
 # mt-server is Linux-only; other platforms get just the client.
 BINS    ?= $(if $(findstring linux,$(TRIPLE)),mt-server mt-client,mt-client)
 
-# Cross builds to another Linux triple use `zig cc` (scripts/zig/) as ring's C compiler and as
-# the linker, unless CC_<triple> / CARGO_TARGET_<TRIPLE>_LINKER are already set.
-# gnu targets link against ZIG_GLIBC's symbol versions, so the binary runs on that glibc or newer.
+# An explicit Linux TARGET (the host's own triple included) uses `zig cc` (scripts/zig/) as ring's
+# C compiler and as the linker, unless CC_<triple> / CARGO_TARGET_<TRIPLE>_LINKER are already set.
+# gnu targets link against ZIG_GLIBC's symbol versions, so the binary runs on that glibc or newer;
+# the system cc would tie it to the build machine's glibc instead.
 # Without zig, a same-CPU target on a Linux host (e.g. musl on a gnu host) builds with the system
 # cc (and rustc's bundled musl startup files and libc); CROSS_CC marks targets that cannot.
 # ZIG defaults to the one `make setup` installs, then to zig on PATH.
 ZIG_HOME  ?= $(or $(XDG_DATA_HOME),$(HOME)/.local/share)/magictunnel
 ZIG       ?= $(firstword $(wildcard $(ZIG_HOME)/zig/zig) $(shell command -v zig 2>/dev/null))
 ZIG_GLIBC ?= 2.17
-CROSS_LINUX := $(if $(and $(TARGET),$(findstring -linux-,$(TARGET))),$(filter-out $(HOST),$(TARGET)))
-SAME_CPU    := $(and $(findstring -linux-,$(HOST)),$(filter $(firstword $(subst -, ,$(HOST))),$(firstword $(subst -, ,$(TARGET)))))
-CROSS_CC    := $(if $(CROSS_LINUX),$(if $(SAME_CPU),,yes))
-TARGET_ENV  := $(subst -,_,$(TARGET))
+LINUX_TARGET := $(if $(findstring -linux-,$(TARGET)),$(TARGET))
+SAME_CPU     := $(and $(findstring -linux-,$(HOST)),$(filter $(firstword $(subst -, ,$(HOST))),$(firstword $(subst -, ,$(TARGET)))))
+CROSS_CC     := $(if $(LINUX_TARGET),$(if $(SAME_CPU),,yes))
+TARGET_ENV   := $(subst -,_,$(TARGET))
 TARGET_ENV_UPPER := $(shell echo '$(TARGET_ENV)' | tr a-z A-Z)
-ifneq ($(and $(CROSS_LINUX),$(ZIG)),)
+ifneq ($(and $(LINUX_TARGET),$(ZIG)),)
 ZIG_ABI := $(lastword $(subst -, ,$(TARGET)))
 export MT_ZIG := $(abspath $(ZIG))
 export MT_ZIG_TARGET := $(firstword $(subst -, ,$(TARGET)))-linux-$(ZIG_ABI)$(if $(filter gnu%,$(ZIG_ABI)),.$(ZIG_GLIBC))
 export CC_$(TARGET_ENV) ?= $(CURDIR)/scripts/zig/cc
 export AR_$(TARGET_ENV) ?= $(CURDIR)/scripts/zig/ar
 export CARGO_TARGET_$(TARGET_ENV_UPPER)_LINKER ?= $(CURDIR)/scripts/zig/cc
-else ifneq ($(and $(CROSS_LINUX),$(SAME_CPU)),)
+else ifneq ($(and $(LINUX_TARGET),$(SAME_CPU)),)
 # cc-rs would insist on <arch>-linux-musl-gcc / musl-gcc; ring's C code builds fine with the host cc.
 export CC_$(TARGET_ENV) ?= cc
 export AR_$(TARGET_ENV) ?= ar
@@ -119,6 +120,13 @@ build: ## (default) Build mt-server/mt-client; PROFILE=dev for debug, TARGET=<tr
 	fi
 	$(CARGO) build $(CARGO_FLAGS) $(addprefix --bin ,$(BINS))
 	@for b in $(BINS); do echo "  -> $(OUT_DIR)/$$b$(EXE)"; done
+	@if [[ "$(TRIPLE)" == *-linux-gnu* && -z "$(MT_ZIG_TARGET)" \
+	    && -z "$${CARGO_TARGET_$(TARGET_ENV_UPPER)_LINKER:-}" ]]; then \
+	  echo "note: linked against this machine's glibc ($$(getconf GNU_LIBC_VERSION 2>/dev/null | cut -d' ' -f2));" \
+	    "it will not start where glibc is older. For other machines:"; \
+	  echo "  make TARGET=$(TRIPLE)   (zig, glibc >= $(ZIG_GLIBC); make setup TARGET=$(TRIPLE) installs zig)"; \
+	  echo "  make TARGET=$(subst -gnu,-musl,$(TRIPLE))   (static, any distribution)"; \
+	fi
 
 all: build
 

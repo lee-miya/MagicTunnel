@@ -1,12 +1,16 @@
 #!/bin/sh
-# `zig cc` as C compiler (for ring) and linker when cross-compiling; the Makefile sets
+# `zig cc` as C compiler (for ring) and linker for Linux targets; the Makefile sets
 # MT_ZIG (zig binary) and MT_ZIG_TARGET (e.g. x86_64-linux-gnu.2.17).
 # Dropped arguments: clang-style --target=<rust triple> from cc-rs (zig rejects it); -Wl,-O1 from
-# rustc (zig's linker warns about it); rustc's bundled musl startup objects, which clash with the
-# ones zig links itself (duplicate _start).
+# rustc (zig's linker warns about it); -Wl,--fix-cortex-a53-843419 from rustc on aarch64-gnu (zig
+# rejects it, so that Cortex-A53 erratum workaround is lost); rustc's bundled musl startup
+# objects, which clash with the ones zig links itself (duplicate _start).
 : "${MT_ZIG:?MT_ZIG not set (path to zig)}" "${MT_ZIG_TARGET:?MT_ZIG_TARGET not set}"
 for a in "$@"; do
-  case "$a" in --target=* | -Wl,-O1 | */self-contained/*crt*.o) ;; *) set -- "$@" "$a" ;; esac
+  case "$a" in
+    --target=* | -Wl,-O1 | -Wl,--fix-cortex-a53-843419 | */self-contained/*crt*.o) ;;
+    *) set -- "$@" "$a" ;;
+  esac
   shift
 done
 exec "$MT_ZIG" cc -target "$MT_ZIG_TARGET" "$@"

@@ -19,7 +19,7 @@ sudo make install     # 二进制到 /usr/local/bin，示例配置与 certs/ 目
                       # systemd 单元到 /etc/systemd/system，sysctl 到 /etc/sysctl.d
 ```
 
-`PREFIX=/usr`、`CONFDIR=...` 会同步改写单元文件里的路径；`DESTDIR=/tmp/pkg` 用于打包暂存。`sudo make uninstall` 删除上述文件但保留 `/etc/magictunnel`（里面有配置和私钥）。要拷到别的机器，用 `make dist`（可加 `TARGET=x86_64-unknown-linux-musl` 交叉编译出全静态二进制，先 `make setup TARGET=x86_64-unknown-linux-musl`，见 README）生成带二进制、配置示例、`deploy/`、文档的 tar 包。
+`PREFIX=/usr`、`CONFDIR=...` 会同步改写单元文件里的路径；`DESTDIR=/tmp/pkg` 用于打包暂存。`sudo make uninstall` 删除上述文件但保留 `/etc/magictunnel`（里面有配置和私钥）。要拷到别的机器，用 `make dist TARGET=<triple>` 生成带二进制、配置示例、`deploy/`、文档的 tar 包：`TARGET=x86_64-unknown-linux-musl` 出全静态二进制，`TARGET=x86_64-unknown-linux-gnu` 出要求 glibc ≥ 2.17 的动态二进制（先 `make setup TARGET=...`，见 README）。不带 `TARGET` 的 `make` 链接的是编译机自己的 glibc，放到 glibc 更旧的服务器上会启动失败。
 
 ## 3. 证书与密钥
 
@@ -150,6 +150,7 @@ scrape_configs:
 | 能 ping 不能上网 | 出口 `iptables` 规则被别的防火墙冲掉；`iptables-save | grep magictunnel` 应有 3 条。 |
 | 大包或 HTTPS 卡住 | 路径 MTU 太小：确认路径能承载 1312 字节的 UDP 报文；若 `tun.mtu` 设得比 1200 大，可以改回 1200。`magictunnel_dropped_packets_total{reason="too_large"}` 会持续增长。 |
 | `exit TUN up ... offload=false` | 内核不支持 TUN offload，已自动退回逐包模式。 |
+| `/lib64/libc.so.6: version 'GLIBC_2.xx' not found` | 二进制是不带 `TARGET` 的 `make`（或 `cargo build`）编的，链接了编译机较新的 glibc。用 `make TARGET=x86_64-unknown-linux-gnu`（glibc ≥ 2.17）或 `TARGET=x86_64-unknown-linux-musl`（全静态）重新编译。 |
 
 ## 10. 安全说明
 

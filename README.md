@@ -45,7 +45,7 @@ scripts/setup-toolchain.sh                    # 安装：C 编译器、GNU make�
                                               # rustup + rust-toolchain.toml 固定的 Rust 版本与 clippy/rustfmt
 ```
 
-脚本可重复执行，已有的会跳过；也可用 `make setup`（需要已有 make 和 bash，全新机器先直接跑脚本）。选项：`--target <triple>`（可多次）装对应 rustup target，跨 CPU 架构的 Linux 目标（或在 macOS 上编 Linux）另装固定版本的 zig 到 `~/.local/share/magictunnel/zig`；`--e2e` 装端到端测试工具并检查 `/dev/net/tun`、非特权用户命名空间；`--yes` 不询问。不改 shell 配置文件：Makefile 自己去 `~/.cargo/bin` 和上面的 zig 目录找工具。Rust 版本由 `rust-toolchain.toml` 固定（下限 1.85，edition 2024），rustup 在仓库内会自动使用它。
+脚本可重复执行，已有的会跳过；也可用 `make setup`（需要已有 make 和 bash，全新机器先直接跑脚本）。选项：`--target <triple>`（可多次）装对应 rustup target，Linux gnu 目标、跨 CPU 架构的 Linux 目标（或在 macOS 上编 Linux）另装固定版本的 zig 到 `~/.local/share/magictunnel/zig`；`--e2e` 装端到端测试工具并检查 `/dev/net/tun`、非特权用户命名空间；`--yes` 不询问。不改 shell 配置文件：Makefile 自己去 `~/.cargo/bin` 和上面的 zig 目录找工具。Rust 版本由 `rust-toolchain.toml` 固定（下限 1.85，edition 2024），rustup 在仓库内会自动使用它。
 
 ```bash
 make                                          # = cargo build --release，产物 target/release/{mt-server,mt-client}
@@ -57,7 +57,7 @@ make config                                   # 交互式生成客户端/出口/
 
 `make help` 列出全部目标：`test`/`clippy`/`ci`、`e2e*`、`perf`、`install`（`PREFIX`/`DESTDIR`/`CONFDIR` 可改）、`dist`（打包成 `dist/magictunnel-<版本>-<target>.tar.gz`，`TARGET=<triple>` 交叉编译）、`cross-check` 等。
 
-交叉编译 Linux 目标（如在 ARM 机器上出 x86_64 二进制）用 [zig](https://ziglang.org/download/) 当 C 编译器和链接器，Makefile 自动接好（优先用 `make setup` 装的 zig，其次 PATH 上的，也可传 `ZIG=/path/to/zig`）：
+不带 `TARGET` 的 `make` 链接编译机自己的 glibc，只适合在同一台（或 glibc 不更旧的）机器上运行；放到老服务器上会报 `GLIBC_2.xx' not found`。要给别的机器用，显式指定 Linux `TARGET`（与编译机相同的 triple 也算），Makefile 会用 [zig](https://ziglang.org/download/) 当 C 编译器和链接器（优先用 `make setup` 装的 zig，其次 PATH 上的，也可传 `ZIG=/path/to/zig`），交叉编译（如在 ARM 机器上出 x86_64 二进制）同理：
 
 ```bash
 make setup TARGET="x86_64-unknown-linux-gnu x86_64-unknown-linux-musl"
@@ -65,7 +65,7 @@ make TARGET=x86_64-unknown-linux-gnu          # 动态链接，要求 glibc ≥ 
 make dist TARGET=x86_64-unknown-linux-musl    # 全静态，任意发行版可用
 ```
 
-已设置 `CC_<triple>` / `CARGO_TARGET_<TRIPLE>_LINKER` 时以它们为准。同架构的 musl 目标（如 x86_64 主机上 `make TARGET=x86_64-unknown-linux-musl`）没有 zig 也行，直接用系统 `cc`。
+已设置 `CC_<triple>` / `CARGO_TARGET_<TRIPLE>_LINKER` 时以它们为准。同架构的 musl 目标（如 x86_64 主机上 `make TARGET=x86_64-unknown-linux-musl`）没有 zig 也行，直接用系统 `cc`；同架构 gnu 目标没有 zig 时也能编，但仍绑定编译机 glibc（构建结束会提示）。
 
 1. 出口节点（需要 root 或 `CAP_NET_ADMIN`，PATH 里要有 `iptables`）：`make config` 选“出口”，或以 `config/server.example.toml` 为模板，`sudo mt-server -c exit1.toml`。
 2. 可选的中继节点（无需特权）：`make config` 选“中继”，或以 `config/relay.example.toml` 为模板，`mt-server -c relay1.toml`。

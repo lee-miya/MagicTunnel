@@ -1,7 +1,8 @@
 #!/bin/sh
 # Install what `make` needs to build magicTunnel on this host (Linux or macOS): system packages
 # (C compiler, GNU make, curl, ...), rustup with the toolchain pinned in rust-toolchain.toml,
-# rustup targets, zig for cross-architecture Linux targets, and optionally the e2e test tools.
+# rustup targets, zig for Linux gnu and cross-architecture Linux targets, and optionally the e2e
+# test tools.
 # Re-runnable: whatever is already present is left alone. POSIX sh, so it runs before bash is
 # installed (Alpine) and on macOS's /bin/sh.
 #
@@ -20,8 +21,8 @@ usage() {
 usage: scripts/setup-toolchain.sh [options]   (also: make setup / make doctor)
 
   --check           only report what is missing; install nothing (exit 1 if anything is)
-  --target TRIPLE   also install the rustup target, plus zig when TRIPLE is a Linux target of
-                    another CPU (or the host is macOS); repeatable
+  --target TRIPLE   also install the rustup target, plus zig when TRIPLE is a Linux gnu target
+                    or a Linux target of another CPU (or the host is macOS); repeatable
   --e2e             also install the end-to-end test tools (Linux)
   -y, --yes         install system packages without asking
   -h, --help        this help
@@ -82,9 +83,10 @@ if [ "$PKG" != brew ] && [ "$(id -u)" -ne 0 ]; then
   command -v sudo >/dev/null 2>&1 && SUDO=sudo
 fi
 
-# Same rule as CROSS_CC in the Makefile: Linux targets the host's cc cannot produce.
+# Linux targets the host's cc cannot produce (CROSS_CC in the Makefile), plus every gnu target:
+# the host's cc would link it against the build machine's glibc rather than ZIG_GLIBC.
 needs_zig() {
-  case $1 in *-linux-*) ;; *) return 1 ;; esac
+  case $1 in *-linux-gnu*) return 0 ;; *-linux-*) ;; *) return 1 ;; esac
   [ "$OS" != linux ] || [ "${1%%-*}" != "$ARCH" ]
 }
 NEED_ZIG=0
@@ -289,7 +291,7 @@ fi
 # ---- zig -------------------------------------------------------------------------------------
 
 if [ "$NEED_ZIG" = 1 ]; then
-  step "zig $ZIG_VERSION (C compiler + linker for cross-architecture Linux targets)"
+  step "zig $ZIG_VERSION (C compiler + linker for Linux gnu / cross-architecture targets)"
   if [ -x "$ZIG" ] && [ "$("$ZIG" version 2>/dev/null)" = "$ZIG_VERSION" ]; then
     ok "zig $ZIG_VERSION ($ZIG)"
   else
