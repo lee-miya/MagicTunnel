@@ -15,6 +15,7 @@ xor_key = "change-me-to-a-long-random-string"
 # [quic]
 # keepalive_secs = 10
 # idle_timeout_secs = 30
+# Governs what this node sends, i.e. the download towards clients; "bbr" helps on lossy links.
 # congestion = "cubic"
 
 # [metrics]

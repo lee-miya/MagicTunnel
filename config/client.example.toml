@@ -25,7 +25,8 @@ mtu = 1200
 # keepalive_secs = 10
 # A silent first hop counts as dead after this; the smaller of both ends' values applies.
 # idle_timeout_secs = 30
-# "cubic", "bbr" (often faster on lossy long-distance links) or "newreno".
+# "cubic", "bbr" (often faster on lossy long-distance links) or "newreno". Only governs what
+# this node sends (here: the upload); exits and relays set their own for the download.
 # congestion = "cubic"
 
 [reconnect]

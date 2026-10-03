@@ -39,7 +39,7 @@
 | --- | --- | --- |
 | `keepalive_secs` | `10` | 空闲链路发保活包的间隔，须 ≥ 1 且小于 `idle_timeout_secs`。也用来维持 NAT 映射。 |
 | `idle_timeout_secs` | `30` | 链路静默这么久即判定死亡（上限 600）。两端取较小值。越小越快发现首跳宕机、越早重连，但在丢包严重的网络上越容易误判。 |
-| `congestion` | `"cubic"` | `"cubic"`、`"bbr"` 或 `"newreno"`。BBR 不把丢包当拥塞信号，在丢包多的长距离链路上通常更快（quinn 将其标为实验性）。 |
+| `congestion` | `"cubic"` | `"cubic"`、`"bbr"` 或 `"newreno"`。BBR 不把丢包当拥塞信号，在丢包多的长距离链路上通常更快（quinn 将其标为实验性）。只决定**本节点发出**方向：客户端管上传，出口与中继管下载，所以要在路径上每个节点都设。修改后重启生效，服务端启动日志 `config loaded` 会打印 `congestion=...`。它与内核的 `net.ipv4.tcp_congestion_control` 无关，后者见 [部署指南](deployment.md#内核参数linux客户端--中继--出口通用)。 |
 
 ### `[reconnect]`
 

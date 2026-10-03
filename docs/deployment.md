@@ -37,14 +37,45 @@ scripts/gen-certs.sh --out certs --server exit1=203.0.113.20 --server relay1 --c
 
 ## 4. 服务端
 
-### 内核参数
+### 内核参数（Linux：客户端 / 中继 / 出口通用）
 
-magicTunnel 给 UDP socket 申请 4 MB 收发缓冲，内核按 `net.core.rmem_max` / `wmem_max` 截断（很多发行版默认只有约 200 KB）。高带宽节点建议放开：
+| 参数 | 客户端 | 中继 | 出口 | 说明 |
+| --- | --- | --- | --- | --- |
+| `net.core.rmem_max` / `wmem_max` = 4194304 | 建议 | **必须** | **必须** | magicTunnel 申请 4 MB UDP 收发缓冲，内核按此上限截断；很多发行版默认只有约 200 KB，突发时会在内核里丢包（`nstat` 的 `UdpRcvbufErrors` 增长） |
+| `net.ipv4.tcp_congestion_control = bbr` + `net.core.default_qdisc = fq` | 建议 | 可选（无影响） | 可选 | 只作用于**本机发起**的 TCP。客户端设了能加快经隧道的上传；出口/中继转发的流量不受影响（下载方向的拥塞算法由远端网站服务器决定） |
+| `[quic] congestion = "bbr"`（配置文件） | 建议 | 建议 | **建议** | 外层 QUIC 链路的拥塞算法，见 [配置参考](configuration.md#quic)。每个节点只管自己的发送方向，下载方向由出口与中继决定；有随机丢包的长距离链路上 cubic 会把窗口压得很小，隧道自己成为瓶颈 |
+
+缓冲上限（所有角色）：
 
 ```bash
 sudo install -m 0644 deploy/sysctl/99-magictunnel.conf /etc/sysctl.d/
 sudo sysctl --system
 ```
+
+缓冲在绑定 socket 时设定，**修改后须重启 mt-server / mt-client**（`sudo make install` 只复制文件，不会执行 `sysctl --system`）。
+
+BBR（内核 ≥ 4.9）：
+
+```bash
+echo tcp_bbr | sudo tee /etc/modules-load.d/bbr.conf
+sudo modprobe tcp_bbr
+printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' \
+  | sudo tee /etc/sysctl.d/98-bbr.conf
+sudo sysctl --system
+```
+
+`default_qdisc` 只对之后新建的队列生效；不想重启机器可执行 `sudo tc qdisc replace dev eth0 root fq`（`eth0` 换成实际网卡）。
+
+验证：
+
+```bash
+sysctl net.core.rmem_max net.core.wmem_max net.ipv4.tcp_congestion_control net.core.default_qdisc
+ss -uamn 'sport = :4433'               # 服务端：skmem 中 rb/tb 应为 8388608（内核报告申请值的两倍）
+sudo ss -uampn | grep -A1 mt-client    # 客户端
+journalctl -u mt-server@exit1 | grep "config loaded"   # 应显示 congestion=Bbr
+```
+
+OpenVZ/LXC 等容器型 VPS 通常不允许修改这些参数（`sysctl` 报 permission denied / read-only），需联系服务商或换 KVM 机型。
 
 `net.ipv4.ip_forward` 不用手动开：出口启动时会打开它，退出时若原来是 0 则恢复。
 
@@ -87,6 +118,8 @@ journalctl -u mt-server@exit1 -f
 | Linux | `sudo mt-client -c client.toml`，或 `deploy/systemd/mt-client.service` | 需要 `ip`（iproute2）。路由带 `proto 233`，崩溃残留可用 `ip -4 route flush proto 233` 清除，下次启动也会自动清。 |
 | macOS | `sudo mt-client -c client.toml` | `tun.name` 用 `utun` 或 `utunN`。尚未真机验证。 |
 | Windows | 管理员终端运行 `mt-client.exe -c client.toml` | 需要 [wintun.dll](https://www.wintun.net)，放在 exe 同目录。尚未真机验证。 |
+
+Linux 客户端同样建议放开 UDP 缓冲上限并启用 BBR，见 [内核参数](#内核参数linux客户端--中继--出口通用)。
 
 客户端只给**首跳**加一条 `/32` 旁路路由，默认流量用 `0.0.0.0/1` + `128.0.0.0/1` 指向 TUN，不修改原默认路由。只接管 IPv4，IPv6 流量不经隧道。
 
@@ -152,6 +185,7 @@ scrape_configs:
 | 能 ping 不能上网 | 出口 `iptables` 规则被别的防火墙冲掉；`iptables-save | grep magictunnel` 应有 3 条。 |
 | 大包或 HTTPS 卡住 | 路径 MTU 太小：确认路径能承载 1312 字节的 UDP 报文；若 `tun.mtu` 设得比 1200 大，可以改回 1200。`magictunnel_dropped_packets_total{reason="too_large"}` 会持续增长。 |
 | `exit TUN up ... offload=false` | 内核不支持 TUN offload，已自动退回逐包模式。 |
+| 下载远慢于上传，`iperf3 -R` 发送方 cwnd 只有几 KB、重传不断 | 回程线路有随机丢包（`iperf3 -u -l 1100 -R` 低速率下也丢几个百分比）。不经隧道直连同样慢，说明不是隧道的问题。出口与中继设 `[quic] congestion = "bbr"`，并放开 UDP 缓冲上限；用 BBR 的网站会明显变快，仍用 cubic 的服务器受丢包所限，只能换线路改善。 |
 | 客户端 `taking over system DNS: ... Read-only file system` | systemd 单元仍是 `ProtectSystem=full`，换用新版 `deploy/systemd/mt-client.service`。 |
 | 客户端日志反复 `overwritten by another program; tunnel DNS re-applied` | NetworkManager 等在频繁改写 `/etc/resolv.conf`。可让它不管 resolv.conf（NetworkManager：`[main] dns=none`），或改用 systemd-resolved。 |
 | 客户端被强杀后 DNS 不通 | 下次启动 `mt-client` 会自动恢复；不想再启动时，Linux 下原文件在 `/var/lib/magictunnel/resolv-conf.json` 的 `original` 字段，macOS 用 `networksetup -setdnsservers <服务名> Empty` 恢复为 DHCP。 |
