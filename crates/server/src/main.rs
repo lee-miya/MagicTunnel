@@ -15,7 +15,7 @@ use clap::Parser;
 use magictunnel_common::metrics::MetricsServer;
 use magictunnel_common::{config::ServerConfig, logging};
 use magictunnel_transport::quinn::VarInt;
-use magictunnel_transport::{TlsMaterial, XorKey, server_endpoint};
+use magictunnel_transport::{TlsMaterial, XorKey, heartbeat, server_endpoint};
 
 use crate::exit::Exit;
 
@@ -83,8 +83,9 @@ async fn main() -> anyhow::Result<()> {
             None => std::future::pending().await,
         }
     };
+    let heartbeat_timeout = heartbeat::timeout(&cfg.quic);
     let result = tokio::select! {
-        e = node::accept(&endpoint, exit.as_ref().map(Exit::handle)) => Err(e),
+        e = node::accept(&endpoint, exit.as_ref().map(Exit::handle), heartbeat_timeout) => Err(e),
         e = exit_downlink => Err(e.context("exit failed")),
         signal = shutdown => {
             tracing::info!("received {signal}, shutting down");

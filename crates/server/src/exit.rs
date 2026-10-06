@@ -16,7 +16,9 @@ use magictunnel_common::ip::ipv4_addrs;
 use magictunnel_common::metrics::Traffic;
 use magictunnel_common::proto::{HelloReply, Resume};
 use magictunnel_transport::quinn::{Connection, VarInt};
-use magictunnel_transport::{ControlStream, Sent, recv_packets, send_packet, too_large_reply};
+use magictunnel_transport::{
+    ControlStream, Sent, heartbeat, recv_packets, send_packet, too_large_reply,
+};
 use magictunnel_tunio::{Arena, BATCH, TunReader, TunWriter, offload_enabled};
 use tokio::task::JoinSet;
 use tun_rs::{AsyncDevice, DeviceBuilder};
@@ -233,6 +235,7 @@ async fn uplink(
                 meter.record(packet.len());
                 true
             }
+            _ if heartbeat::answer(conn, packet) => false,
             addrs => {
                 tracing::trace!(%tunnel_ip, ?addrs, len = packet.len(), "dropping client packet");
                 DROP_FILTERED.inc();

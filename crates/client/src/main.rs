@@ -16,6 +16,7 @@ use clap::Parser;
 use magictunnel_common::metrics::MetricsServer;
 use magictunnel_common::proto::Resume;
 use magictunnel_common::{config::ClientConfig, logging};
+use magictunnel_transport::heartbeat;
 
 use crate::dns::DnsGuard;
 use crate::route::RouteGuard;
@@ -105,7 +106,7 @@ async fn run(cfg: &ClientConfig, mut session: Session) -> anyhow::Result<()> {
         metrics::set_current(Some(session.conn.clone()));
         let up_since = Instant::now();
         let stop = tokio::select! {
-            stop = pump::run(&tun.dev, &session.conn, cfg.tun.mtu) => stop,
+            stop = pump::run(&tun.dev, &session.conn, cfg.tun.mtu, heartbeat::timeout(&cfg.quic)) => stop,
             signal = &mut shutdown => {
                 tracing::info!("received {signal}, shutting down");
                 metrics::set_current(None);

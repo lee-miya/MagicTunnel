@@ -11,9 +11,10 @@
 #            192.168.1.2                    ├─ exit   198.51.100.20  mt-server + NAT
 #                                           └─ web    198.51.100.80  HTTP, TCP echo
 #
-# Checks: the first hop crashing and the exit restarting are both survived: the client keeps
+# Checks: the first hop crashing, the exit restarting and the uplink to the first hop going
+# dark (only one way) are all survived: the client notices (the last by heartbeat), keeps
 # TUN and routes (nothing leaks onto the LAN meanwhile), reconnects with backoff, gets its
-# tunnel address back, and a TCP connection open across both outages carries on; metrics
+# tunnel address back, and a TCP connection open across all outages carries on; metrics
 # endpoints and stats logs report all of it; when the path MTU shrinks mid-session, senders
 # get ICMP "fragmentation needed" from the client and the relay and TCP keeps working;
 # SIGTERM while reconnecting still restores the host.
@@ -283,16 +284,34 @@ check "2 MB HTTP download is intact" blob_intact client
 expect "client: two reconnects" 2 metric client magictunnel_reconnects_total
 check "exit: resumed sessions counted" test "$(metric exit magictunnel_resumed_sessions_total)" -ge 1
 
-echo "== a TCP connection open across both outages carried on"
+echo "== only the uplink to the first hop goes dark"
+# relay1's packets still reach the client, and its retransmissions keep the client's QUIC idle
+# timer fresh: without heartbeats this went unnoticed for about twice the idle timeout.
+DARK=(FORWARD -i lan -p udp -d "$RELAY1" --dport 4433 -j DROP)
+lost=$(count 'tunnel lost' client.log)
+restored=$(count 'tunnel restored' client.log)
+ns router iptables -I "${DARK[@]}"
+LOST=$SECONDS
+check "client notices within the idle timeout" wait_count client.log 'tunnel lost' $((lost + 1)) 6
+echo "  lost after $((SECONDS - LOST))s: $(grep -o 'tunnel lost.*' client.log | tail -1 | cut -c1-120)"
+check "it was the heartbeat that noticed" bash -c "grep 'tunnel lost' client.log | tail -1 | grep -q 'stopped answering heartbeats'"
+ns router iptables -D "${DARK[@]}"
+check "client restores the tunnel" wait_count client.log 'tunnel restored' $((restored + 1)) 30
+echo "  restored $((SECONDS - LOST))s after the uplink went dark"
+check "same tunnel address" grep -q "tunnel restored.*addr=$TUN_IP " <(grep 'tunnel restored' client.log | tail -1)
+check "ping web again" ping_clean client $WEB 3
+
+echo "== a TCP connection open across all outages carried on"
 touch stop-chat
 rc=0; wait $CHAT || rc=$?
 expect "chat exit status" 0 echo $rc
 sed 's/^/  /' chat.log
 
 echo "== SIGTERM while reconnecting restores the host"
+lost=$(count 'tunnel lost' client.log)
 kill -KILL "$PID_relay1"
 wait "$PID_relay1" 2>/dev/null || true
-check "client notices" wait_count client.log 'tunnel lost' 3 8
+check "client notices" wait_count client.log 'tunnel lost' $((lost + 1)) 8
 sleep 1
 kill -TERM $CLI
 rc=0

@@ -168,9 +168,9 @@ scrape_configs:
 
 ## 8. 运维
 
-- **滚动升级 / 重启**：重启中继或出口时，经过它的客户端会断线并自动重连（客户端默认最多等 30 秒退避），出口重启后客户端拿回原地址，已建立的 TCP 连接通常能继续。一次只重启一个节点。
+- **滚动升级 / 重启**：重启中继或出口时，经过它的客户端会断线并自动重连（客户端默认最多等 30 秒退避），出口重启后客户端拿回原地址，已建立的 TCP 连接通常能继续。一次只重启一个节点。跨协议版本的升级（见 [协议兼容](configuration.md#协议兼容)）例外：新旧节点互相拒绝，要把所有节点一起升级。
 - **改配置**：没有热加载，改完重启进程。
-- **调快故障发现**：`[quic] idle_timeout_secs` 调小（例如 10，keepalive 3）能更快发现首跳宕机；需要两端都调小才生效。
+- **调快故障发现**：`[quic] idle_timeout_secs` 调小（例如 10，keepalive 3）能更快发现首跳宕机；静默超时需要两端都调小才生效，心跳超时只看拨号方（客户端、中继）自己的配置。单向不通（日志 `tunnel heartbeat: peer stopped answering heartbeats for Ns`）也在这个时间内发现。
 - **容量**：地址池 `/24` 可容纳 253 个客户端；会话占用内存很小，瓶颈通常是 CPU（加密 + 拷贝）。用 `scripts/e2e/perf.sh` 可以在单机上估算每字节开销。
 
 ## 9. 排障
@@ -182,6 +182,8 @@ scrape_configs:
 | `tunnel rejected: ...: this node is not an exit` | 路径最后一跳没有 `[exit]` 段。 |
 | `tunnel rejected: ...: cannot reach <hop>` | 那一跳的上一跳连不上它（地址、端口、key、证书）。 |
 | `tunnel address pool exhausted` | 出口地址池用完，扩大 `exit.pool`。 |
+| `unsupported protocol version` | 路径上有节点还是旧版本，所有节点升级到同一版本。 |
+| 客户端反复 `peer stopped answering heartbeats`，其间仍能收到对端数据 | 本机到首跳的上行被丢（NAT 映射失效、运营商 UDP 限速、中间代理）。重连会换新的源端口，常能绕过；频繁出现时在两端抓 UDP 包确认丢在哪一段。 |
 | 能 ping 不能上网 | 出口 `iptables` 规则被别的防火墙冲掉；`iptables-save | grep magictunnel` 应有 3 条。 |
 | 大包或 HTTPS 卡住 | 路径 MTU 太小：确认路径能承载 1312 字节的 UDP 报文；若 `tun.mtu` 设得比 1200 大，可以改回 1200。`magictunnel_dropped_packets_total{reason="too_large"}` 会持续增长。 |
 | `exit TUN up ... offload=false` | 内核不支持 TUN offload，已自动退回逐包模式。 |

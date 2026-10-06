@@ -3,10 +3,11 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use magictunnel_common::ip::{ipv4_addrs, is_ipv4};
 use magictunnel_transport::quinn::Connection;
-use magictunnel_transport::{Sent, recv_packets, send_packet_wait, too_large_reply};
+use magictunnel_transport::{Liveness, Sent, recv_packets, send_packet_wait, too_large_reply};
 use magictunnel_tunio::{Arena, BATCH, TunReader, TunWriter};
 use tokio::task::JoinSet;
 use tun_rs::AsyncDevice;
@@ -22,13 +23,30 @@ pub enum Stop {
     Tun(anyhow::Error),
 }
 
-/// Runs both directions until one fails, returning why. `max_mtu` bounds the TUN MTU over the
-/// device's lifetime.
-pub async fn run(dev: &Arc<AsyncDevice>, conn: &Connection, max_mtu: u16) -> Stop {
+/// Runs both directions until one fails or the first hop stops answering heartbeats for
+/// `heartbeat_timeout`, returning why. `max_mtu` bounds the TUN MTU over the device's lifetime.
+pub async fn run(
+    dev: &Arc<AsyncDevice>,
+    conn: &Connection,
+    max_mtu: u16,
+    heartbeat_timeout: Duration,
+) -> Stop {
+    let liveness = Arc::new(Liveness::default());
     let mut tasks = JoinSet::new();
     tasks.spawn(uplink(Arc::clone(dev), conn.clone(), max_mtu));
-    tasks.spawn(downlink(conn.clone(), Arc::clone(dev)));
-    let stop = match tasks.join_next().await.expect("two tasks were spawned") {
+    tasks.spawn(downlink(
+        conn.clone(),
+        Arc::clone(dev),
+        Arc::clone(&liveness),
+    ));
+    let watched = conn.clone();
+    tasks.spawn(async move {
+        let e = liveness.watch(&watched, heartbeat_timeout).await;
+        Err(Stop::Tunnel(
+            anyhow::Error::new(e).context("tunnel heartbeat"),
+        ))
+    });
+    let stop = match tasks.join_next().await.expect("tasks were spawned") {
         Ok(Err(stop)) => stop,
         Ok(Ok(never)) => match never {},
         Err(e) => std::panic::resume_unwind(e.into_panic()),
@@ -74,8 +92,13 @@ async fn uplink(dev: Arc<AsyncDevice>, conn: Connection, max_mtu: u16) -> Result
     }
 }
 
-/// Tunnel to TUN, in batches of whatever has arrived, so offload can coalesce them.
-async fn downlink(conn: Connection, dev: Arc<AsyncDevice>) -> Result<Infallible, Stop> {
+/// Tunnel to TUN, in batches of whatever has arrived, so offload can coalesce them. Pongs go
+/// to `liveness` instead.
+async fn downlink(
+    conn: Connection,
+    dev: Arc<AsyncDevice>,
+    liveness: Arc<Liveness>,
+) -> Result<Infallible, Stop> {
     let mut writer = TunWriter::new(dev);
     let mut batch = Vec::with_capacity(BATCH);
     loop {
@@ -84,6 +107,9 @@ async fn downlink(conn: Connection, dev: Arc<AsyncDevice>) -> Result<Infallible,
             .await
             .map_err(|e| Stop::Tunnel(anyhow::Error::new(e).context("receiving from tunnel")))?;
         batch.retain(|packet| {
+            if liveness.observe(packet) {
+                return false;
+            }
             let ok = ipv4_addrs(packet).is_some();
             if ok {
                 DOWN.record(packet.len());

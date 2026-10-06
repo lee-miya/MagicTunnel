@@ -5,6 +5,7 @@ pub mod control;
 pub mod datagram;
 pub mod endpoint;
 pub mod error;
+pub mod heartbeat;
 pub mod obfs;
 pub mod tls;
 
@@ -18,6 +19,7 @@ pub use datagram::{
 };
 pub use endpoint::{bind_obfuscated, client_endpoint, connect, server_endpoint, transport_config};
 pub use error::{Error, Result};
+pub use heartbeat::Liveness;
 pub use obfs::{XorKey, XorSocket};
 pub use quinn;
 pub use tls::TlsMaterial;

@@ -4,7 +4,7 @@
 //! its two neighbours: the rest of the route is passed on, not kept.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use magictunnel_common::metrics::Traffic;
@@ -16,7 +16,8 @@ use crate::metrics::{RELAY_DOWN, RELAY_SESSIONS, RELAY_SESSIONS_TOTAL, RELAY_UP}
 use crate::node::reject;
 
 /// Runs one relayed tunnel: sets up the next link, passes the exit's reply back, then forwards
-/// datagrams both ways until either side goes away. Only setup failures are returned.
+/// datagrams both ways until either side goes away or the next hop stops answering
+/// heartbeats for `heartbeat_timeout`. Only setup failures are returned.
 pub async fn run(
     endpoint: &Endpoint,
     upstream: Connection,
@@ -24,6 +25,7 @@ pub async fn run(
     next: &Hop,
     rest: &[Hop],
     resume: Option<Resume>,
+    heartbeat_timeout: Duration,
 ) -> anyhow::Result<()> {
     let peer = upstream.remote_address();
     let name = &next.server_name;
@@ -74,6 +76,7 @@ pub async fn run(
         downstream.clone(),
         Arc::clone(&up),
         Arc::clone(&down),
+        heartbeat_timeout,
     )
     .await;
     upstream.close(VarInt::from_u32(0), b"relay closed");

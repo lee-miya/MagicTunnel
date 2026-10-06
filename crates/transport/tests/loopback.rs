@@ -10,8 +10,8 @@ use magictunnel_common::metrics::Traffic;
 use magictunnel_common::proto::{HelloReply, Hop};
 use magictunnel_transport::quinn::{self, Endpoint};
 use magictunnel_transport::{
-    Sent, TlsMaterial, XorKey, accept_hello, client_endpoint, connect, hello, recv_packet,
-    recv_packets, relay, send_packet, send_packet_wait, server_endpoint,
+    Error, Liveness, Sent, TlsMaterial, XorKey, accept_hello, client_endpoint, connect, heartbeat,
+    hello, recv_packet, recv_packets, relay, send_packet, send_packet_wait, server_endpoint,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
@@ -21,6 +21,9 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 const KEY: &[u8] = b"loopback-test-key";
 const NO_CONNECT_WAIT: Duration = Duration::from_secs(2);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Short enough for a test, long enough for a few one-second pings.
+const SHORT_HEARTBEAT: Duration = Duration::from_secs(2);
 
 struct Ca {
     der: CertificateDer<'static>,
@@ -84,9 +87,19 @@ fn tunnel_reply() -> HelloReply {
     }
 }
 
-/// Exit node: completes the handshake with each peer, then echoes every datagram. Peers that
-/// fail the handshake are skipped, as the negative tests expect.
+/// Exit node: completes the handshake with each peer, then answers heartbeats and echoes
+/// every other datagram. Peers that fail the handshake are skipped, as the negative tests
+/// expect.
 fn spawn_exit(tls: &TlsMaterial) -> SocketAddr {
+    spawn_exit_with(tls, true)
+}
+
+/// An exit that never answers heartbeats, as the dialer sees one its packets do not reach.
+fn spawn_mute_exit(tls: &TlsMaterial) -> SocketAddr {
+    spawn_exit_with(tls, false)
+}
+
+fn spawn_exit_with(tls: &TlsMaterial, answers: bool) -> SocketAddr {
     let endpoint = server_endpoint(localhost(), xor_key(KEY), tls, &QuicConfig::default()).unwrap();
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(async move {
@@ -97,17 +110,27 @@ fn spawn_exit(tls: &TlsMaterial) -> SocketAddr {
             };
             assert!(hello.remaining.is_empty());
             control.send(&tunnel_reply()).await.unwrap();
-            while let Ok(packet) = recv_packet(&conn).await {
-                send_packet(&conn, packet).unwrap();
-            }
+            tokio::spawn(async move {
+                let _control = control;
+                while let Ok(packet) = recv_packet(&conn).await {
+                    if heartbeat::is_heartbeat(&packet) {
+                        if answers {
+                            heartbeat::answer(&conn, &packet);
+                        }
+                        continue;
+                    }
+                    send_packet(&conn, packet).unwrap();
+                }
+            });
         }
     });
     addr
 }
 
 /// Relay node: dials the next hop named in the handshake, relays the reply back, then
-/// forwards datagrams in both directions.
-fn spawn_relay(tls: &TlsMaterial) -> SocketAddr {
+/// forwards datagrams in both directions until either side fails or the next hop stops
+/// answering heartbeats for `heartbeat_timeout`; then closes both links.
+fn spawn_relay(tls: &TlsMaterial, heartbeat_timeout: Duration) -> SocketAddr {
     let endpoint = server_endpoint(localhost(), xor_key(KEY), tls, &QuicConfig::default()).unwrap();
     let addr = endpoint.local_addr().unwrap();
     tokio::spawn(async move {
@@ -120,10 +143,20 @@ fn spawn_relay(tls: &TlsMaterial) -> SocketAddr {
         let (_next_control, reply) = hello(&downstream, rest.to_vec(), None).await.unwrap();
         control.send(&reply).await.unwrap();
         let meter = || Arc::new(Traffic::new());
-        relay(upstream, downstream, meter(), meter()).await;
-        drop(endpoint);
+        let links = (upstream.clone(), downstream.clone());
+        relay(upstream, downstream, meter(), meter(), heartbeat_timeout).await;
+        links.0.close(0u32.into(), b"relay closed");
+        links.1.close(0u32.into(), b"relay closed");
+        endpoint.wait_idle().await;
     });
     addr
+}
+
+fn exit_route(exit: SocketAddr) -> Vec<Hop> {
+    vec![Hop {
+        addr: exit,
+        server_name: "exit1".into(),
+    }]
 }
 
 async fn assert_echo(conn: &quinn::Connection) {
@@ -170,15 +203,11 @@ async fn single_hop_handshake_and_datagrams() {
 async fn two_hop_relay() {
     let ca = Ca::new("test CA");
     let exit = spawn_exit(&ca.node("exit1"));
-    let relay = spawn_relay(&ca.node("relay1"));
+    let relay = spawn_relay(&ca.node("relay1"), HEARTBEAT_TIMEOUT);
 
     let (_endpoint, conn) = dial(&ca.node("client1"), KEY, relay, "relay1").await;
     let conn = conn.unwrap();
-    let route = vec![Hop {
-        addr: exit,
-        server_name: "exit1".into(),
-    }];
-    let (_control, reply) = hello(&conn, route, None).await.unwrap();
+    let (_control, reply) = hello(&conn, exit_route(exit), None).await.unwrap();
     assert_eq!(reply, tunnel_reply());
     assert_echo(&conn).await;
 }
@@ -187,8 +216,8 @@ async fn two_hop_relay() {
 async fn three_hop_relay() {
     let ca = Ca::new("test CA");
     let exit = spawn_exit(&ca.node("exit1"));
-    let relay2 = spawn_relay(&ca.node("relay2"));
-    let relay1 = spawn_relay(&ca.node("relay1"));
+    let relay2 = spawn_relay(&ca.node("relay2"), HEARTBEAT_TIMEOUT);
+    let relay1 = spawn_relay(&ca.node("relay1"), HEARTBEAT_TIMEOUT);
 
     let (_endpoint, conn) = dial(&ca.node("client1"), KEY, relay1, "relay1").await;
     let conn = conn.unwrap();
@@ -339,4 +368,80 @@ async fn batches_queued_datagrams_and_waits_for_buffer_space() {
     // Loopback does not reorder or lose, so the echoes arrive in order.
     let firsts: Vec<u8> = got.iter().map(|p| p[0]).collect();
     assert_eq!(firsts, (0..count).collect::<Vec<_>>());
+}
+
+/// Watches `conn` with `timeout`, feeding it whatever arrives; returns how long it took to
+/// give up, or `None` if it had not after `wait`.
+async fn watch_for(
+    conn: &quinn::Connection,
+    timeout: Duration,
+    wait: Duration,
+) -> Option<Duration> {
+    let liveness = Arc::new(Liveness::default());
+    let receiver = {
+        let (conn, liveness) = (conn.clone(), Arc::clone(&liveness));
+        tokio::spawn(async move {
+            while let Ok(packet) = recv_packet(&conn).await {
+                liveness.observe(&packet);
+            }
+        })
+    };
+    let started = tokio::time::Instant::now();
+    let result = tokio::time::timeout(wait, liveness.watch(conn, timeout)).await;
+    receiver.abort();
+    result.ok().map(|e| {
+        assert!(matches!(e, Error::Unresponsive(t) if t == timeout), "{e}");
+        started.elapsed()
+    })
+}
+
+#[tokio::test]
+async fn heartbeats_keep_an_answering_link() {
+    let ca = Ca::new("test CA");
+    let exit = spawn_exit(&ca.node("exit1"));
+    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, exit, "exit1").await;
+    let conn = conn.unwrap();
+    let (_control, _) = hello(&conn, vec![], None).await.unwrap();
+
+    let gave_up = watch_for(&conn, SHORT_HEARTBEAT, SHORT_HEARTBEAT * 2).await;
+    assert_eq!(gave_up, None);
+}
+
+#[tokio::test]
+async fn heartbeats_give_up_a_link_that_does_not_answer() {
+    let ca = Ca::new("test CA");
+    let exit = spawn_mute_exit(&ca.node("exit1"));
+    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, exit, "exit1").await;
+    let conn = conn.unwrap();
+    let (_control, _) = hello(&conn, vec![], None).await.unwrap();
+
+    // QUIC itself still sees a healthy link: the exit acknowledges every ping.
+    let gave_up = watch_for(&conn, SHORT_HEARTBEAT, SHORT_HEARTBEAT * 2).await;
+    let gave_up = gave_up.expect("the watch did not give up");
+    assert!(gave_up >= SHORT_HEARTBEAT, "after {gave_up:?}");
+    assert!(conn.close_reason().is_none());
+}
+
+#[tokio::test]
+async fn relay_answers_heartbeats_and_drops_a_mute_next_hop() {
+    let ca = Ca::new("test CA");
+    let exit = spawn_mute_exit(&ca.node("exit1"));
+    let relay = spawn_relay(&ca.node("relay1"), SHORT_HEARTBEAT);
+    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, relay, "relay1").await;
+    let conn = conn.unwrap();
+    let (_control, _) = hello(&conn, exit_route(exit), None).await.unwrap();
+
+    // The relay answers the client's pings itself (the exit would not), until it gives up on
+    // the exit and closes the client's link.
+    heartbeat::ping(&conn).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(1), recv_packet(&conn))
+        .await
+        .expect("no answer to the ping")
+        .unwrap();
+    assert!(heartbeat::is_heartbeat(&reply), "{reply:?}");
+    let closed = tokio::time::timeout(SHORT_HEARTBEAT * 2, conn.closed()).await;
+    assert!(
+        matches!(closed, Ok(quinn::ConnectionError::ApplicationClosed(_))),
+        "{closed:?}"
+    );
 }

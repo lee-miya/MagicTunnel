@@ -1,12 +1,14 @@
 //! Control-plane message types exchanged on the reliable QUIC stream at connection setup.
-//! The data plane carries one raw IP packet per QUIC datagram and has no framing of its own.
+//! The data plane carries one raw IP packet per QUIC datagram and has no framing of its own,
+//! apart from one-byte heartbeats on every link.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
 pub const ALPN: &[u8] = b"magictunnel/1";
-pub const PROTOCOL_VERSION: u16 = 1;
+/// 2: the dialer of every link expects heartbeats answered, which version 1 nodes do not.
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Longest route, exit included. Bounds the connections and handshake time one client can
 /// make a path spend.
 pub const MAX_HOPS: usize = 8;

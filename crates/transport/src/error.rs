@@ -50,6 +50,9 @@ pub enum Error {
     #[error("control handshake timed out")]
     HandshakeTimeout,
 
+    #[error("peer stopped answering heartbeats for {}s", .0.as_secs())]
+    Unresponsive(std::time::Duration),
+
     #[error("peer speaks protocol version {0}, expected {expected}", expected = magictunnel_common::proto::PROTOCOL_VERSION)]
     VersionMismatch(u16),
 }
