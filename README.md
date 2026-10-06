@@ -68,6 +68,46 @@ make dist TARGET=x86_64-unknown-linux-musl    # 全静态，任意发行版可�
 
 已设置 `CC_<triple>` / `CARGO_TARGET_<TRIPLE>_LINKER` 时以它们为准。同架构的 musl 目标（如 x86_64 主机上 `make TARGET=x86_64-unknown-linux-musl`）没有 zig 也行，直接用系统 `cc`；同架构 gnu 目标没有 zig 时也能编，但仍绑定编译机 glibc（构建结束会提示）。
 
+### 静态编译（发给其他机器用）
+
+各平台"静态"的程度不同：Linux 用 musl 可以完全静态；macOS 不支持完全静态，Rust 程序只动态链接每台 Mac 都自带的 `libSystem`；Windows 可以把 C 运行库静态链进 exe，但 Wintun 驱动的 `wintun.dll` 只能随 exe 一起分发。`mt-server` 只有 Linux 版，macOS / Windows 只产出 `mt-client`。
+
+**Linux**（任意 Linux 主机，跨架构也行；首次先 `make setup` 装 rustup target 与 zig）：
+
+```bash
+make setup TARGET="x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+make dist TARGET=x86_64-unknown-linux-musl    # -> dist/magictunnel-<版本>-x86_64-unknown-linux-musl.tar.gz
+make dist TARGET=aarch64-unknown-linux-musl   # -> dist/magictunnel-<版本>-aarch64-unknown-linux-musl.tar.gz
+file target/x86_64-unknown-linux-musl/release/mt-server   # 应显示 statically linked
+```
+
+只要二进制不要打包时把 `dist` 换成 `make`（产物在 `target/<triple>/release/`）。
+
+**macOS**（须在 Mac 上编译；用 Homebrew 的 GNU make，即 `gmake`）：
+
+```bash
+scripts/setup-toolchain.sh --target aarch64-apple-darwin --target x86_64-apple-darwin
+export MACOSX_DEPLOYMENT_TARGET=11.0          # 可选：最低支持的 macOS 版本
+gmake dist TARGET=aarch64-apple-darwin        # Apple 芯片
+gmake dist TARGET=x86_64-apple-darwin         # Intel
+# 可选：合成一个同时支持两种 CPU 的通用二进制
+lipo -create -output mt-client \
+  target/aarch64-apple-darwin/release/mt-client target/x86_64-apple-darwin/release/mt-client
+otool -L mt-client                            # 应只列出 /usr/lib/libSystem.B.dylib 等系统库
+```
+
+**Windows**（须在 Windows 上编译，需要 [rustup](https://rustup.rs) 和 Visual Studio Build Tools 的"使用 C++ 的桌面开发"组件；PowerShell 中执行）：
+
+```powershell
+rustup target add x86_64-pc-windows-msvc
+$env:RUSTFLAGS = "-C target-feature=+crt-static"   # 静态链接 C 运行库，目标机无需安装 VC++ 运行库
+cargo build --release --bin mt-client --target x86_64-pc-windows-msvc
+# 产物：target\x86_64-pc-windows-msvc\release\mt-client.exe
+# 从 https://www.wintun.net 下载 wintun.dll（选与 exe 相同的架构），放在 mt-client.exe 同目录
+```
+
+ARM64 Windows 把上面的 triple 换成 `aarch64-pc-windows-msvc`（ring 在该目标上还需要安装 clang）。在 Linux 上无法交叉链接出可用的 Windows / macOS 客户端，`make cross-check` 只做类型检查。macOS / Windows 的构建命令尚未在真机上验证。
+
 1. 出口节点（需要 root 或 `CAP_NET_ADMIN`，PATH 里要有 `iptables`）：`make config` 选“出口”，或以 `config/server.example.toml` 为模板，`sudo mt-server -c exit1.toml`。
 2. 可选的中继节点（无需特权）：`make config` 选“中继”，或以 `config/relay.example.toml` 为模板，`mt-server -c relay1.toml`。
 3. 客户端（需要 root / 管理员）：`make config` 选“客户端”并按顺序填写路径，或以 `config/client.example.toml` 为模板写好 `[[route]]`，`sudo mt-client -c client1.toml`。
