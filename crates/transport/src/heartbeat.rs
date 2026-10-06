@@ -1,124 +1,88 @@
-//! Per-link heartbeat. QUIC's idle timeout only notices a link that has gone silent. When the
-//! dialer's packets stop reaching the peer while the peer's still arrive, the peer's
-//! retransmissions keep the dialer's idle timer fresh, and the link looks alive for about
-//! twice the timeout. So the side that dialed a link pings it, the other side answers, and the
-//! dialer gives the link up once [`timeout`] passes without an answer.
+//! Per-link heartbeat. QUIC's idle timeout only fires at an end that hears nothing, and
+//! silently. When one end's packets stop reaching the other while the other's still arrive,
+//! the deaf end gives up without a word, and the end that still hears retransmissions only
+//! notices once they stop, after about twice the timeout. So each end of a link watches what
+//! it receives itself and, once [`timeout`] passes without a single packet from the peer,
+//! closes the link explicitly: the close travels the direction that still works, so the other
+//! end learns at once.
 //!
-//! Heartbeats are one-byte datagrams, which no IP packet (20 bytes at least) is mistaken for.
-//! They queue with the IP packets: quinn only fills the room datagrams leave with stream
-//! frames, so on a saturated link anything sent on the control stream would starve. One
-//! dropped from a full queue is covered by sending several per timeout.
+//! Liveness is judged by arrivals of any kind rather than by answers to pings: a full datagram
+//! queue drops its oldest entries, which an answer queued behind a flood would be, while a
+//! link that is carrying a flood is plainly alive. Both ends ping, so an idle link still
+//! carries something both ways. Pings are one-byte datagrams, which no IP packet (20 bytes at
+//! least) is mistaken for; the receiver drops them.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 use bytes::Bytes;
 use magictunnel_common::config::QuicConfig;
-use quinn::Connection;
-use tokio::time::Instant;
+use quinn::{Connection, VarInt};
+use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::datagram::send_packet;
 use crate::{Error, Result};
 
 const PING: u8 = 0x01;
-const PONG: u8 = 0x02;
-const PINGS_PER_TIMEOUT: u32 = 6;
-const MIN_INTERVAL: Duration = Duration::from_secs(1);
+/// What the peer reads as the close reason when it is the one that went quiet.
+pub const SILENT_PEER: &[u8] = b"heard nothing from you";
+/// Checks of the receive counter per timeout. A link is given up at most two ticks late,
+/// which [`quic_idle_timeout`] leaves room for.
+const TICKS_PER_TIMEOUT: u32 = 12;
+const TICKS_PER_PING: u32 = 2;
 
-/// How long a link may go without answering heartbeats: the configured idle timeout, so a
-/// link that only works one way is given up as soon as a silent one would be.
+/// How long a link may go without a packet from the peer: the configured idle timeout.
 pub fn timeout(quic: &QuicConfig) -> Duration {
     Duration::from_secs(quic.idle_timeout_secs)
 }
 
-fn kind(packet: &[u8]) -> Option<u8> {
-    match packet {
-        [b @ (PING | PONG)] => Some(*b),
-        _ => None,
-    }
+/// QUIC's own idle timeout: past [`timeout`], so the watch closes a silent link explicitly
+/// before QUIC drops it without telling the peer. Still in force before the watch starts.
+pub fn quic_idle_timeout(quic: &QuicConfig) -> Duration {
+    let timeout = timeout(quic);
+    timeout + tick(timeout) * 3
 }
 
-/// Whether `packet` is a heartbeat rather than an IP packet.
+fn tick(timeout: Duration) -> Duration {
+    (timeout / TICKS_PER_TIMEOUT).max(Duration::from_millis(1))
+}
+
+/// Whether `packet` is a heartbeat rather than an IP packet; receivers drop these.
 pub fn is_heartbeat(packet: &[u8]) -> bool {
-    kind(packet).is_some()
+    packet == [PING]
 }
 
-/// For the accepting side of a link: answers `packet` if it is a ping. Returns whether it was
-/// a heartbeat, which is consumed here and not to be passed on.
-pub fn answer(conn: &Connection, packet: &[u8]) -> bool {
-    match kind(packet) {
-        Some(PING) => {
-            let _ = send_packet(conn, Bytes::from_static(&[PONG]));
-            true
-        }
-        Some(_) => true,
-        None => false,
-    }
-}
-
-/// The dialing side's view of whether its peer still answers.
-#[derive(Debug)]
-pub struct Liveness {
-    started: Instant,
-    /// Milliseconds after `started` at which the last pong arrived.
-    last_pong: AtomicU64,
-}
-
-impl Default for Liveness {
-    fn default() -> Self {
-        Self {
-            started: Instant::now(),
-            last_pong: AtomicU64::new(0),
-        }
-    }
-}
-
-impl Liveness {
-    /// For the dialing side of a link: records `packet` if it is a pong. Returns whether it was
-    /// a heartbeat, which is consumed here and not to be passed on.
-    pub fn observe(&self, packet: &[u8]) -> bool {
-        match kind(packet) {
-            Some(PONG) => {
-                let ms = self.started.elapsed().as_millis();
-                self.last_pong
-                    .fetch_max(u64::try_from(ms).unwrap_or(u64::MAX), Relaxed);
-                true
-            }
-            Some(_) => true,
-            None => false,
-        }
-    }
-
-    fn last_pong(&self) -> Instant {
-        self.started + Duration::from_millis(self.last_pong.load(Relaxed))
-    }
-
-    /// Pings `conn` until `timeout` passes without a pong (counting from when this was
-    /// created), then returns [`Error::Unresponsive`]; or returns the error that ended the
-    /// connection first. Pongs must be fed to [`Liveness::observe`] by the receive loop.
-    pub async fn watch(&self, conn: &Connection, timeout: Duration) -> Error {
-        let interval = (timeout / PINGS_PER_TIMEOUT).max(MIN_INTERVAL);
-        let mut next_ping = Instant::now();
-        loop {
-            let deadline = self.last_pong() + timeout;
-            let now = Instant::now();
-            if now >= deadline {
-                return Error::Unresponsive(timeout);
-            }
-            if now >= next_ping {
-                if let Err(e) = ping(conn) {
-                    return e;
-                }
-                next_ping = now + interval;
-            }
-            tokio::time::sleep_until(next_ping.min(deadline)).await;
-        }
-    }
-}
-
-/// Sends one ping; [`Liveness::watch`] does so periodically.
+/// Sends one ping; [`watch`] does so periodically.
 pub fn ping(conn: &Connection) -> Result<()> {
     send_packet(conn, Bytes::from_static(&[PING])).map(drop)
+}
+
+/// For either end of a link: pings `conn` every `timeout / 6` until `timeout` passes without
+/// any packet arriving from the peer, then closes the connection with [`SILENT_PEER`] and
+/// returns [`Error::Unresponsive`]; or returns the error that ended the connection first.
+pub async fn watch(conn: &Connection, timeout: Duration) -> Error {
+    let mut ticks = tokio::time::interval(tick(timeout));
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut received = conn.stats().udp_rx.datagrams;
+    let mut heard = Instant::now();
+    let mut n: u32 = 0;
+    loop {
+        ticks.tick().await;
+        let now = Instant::now();
+        let count = conn.stats().udp_rx.datagrams;
+        if count != received {
+            received = count;
+            heard = now;
+        } else if now - heard >= timeout {
+            conn.close(VarInt::from_u32(0), SILENT_PEER);
+            return Error::Unresponsive(timeout);
+        }
+        if n.is_multiple_of(TICKS_PER_PING)
+            && let Err(e) = ping(conn)
+        {
+            return e;
+        }
+        n = n.wrapping_add(1);
+    }
 }
 
 #[cfg(test)]
@@ -128,21 +92,25 @@ mod tests {
     #[test]
     fn tells_heartbeats_from_ip_packets() {
         assert!(is_heartbeat(&[PING]));
-        assert!(is_heartbeat(&[PONG]));
-        for other in [&[][..], &[0x00], &[0x45], &[PING, PING], &[0x45; 20]] {
+        for other in [
+            &[][..],
+            &[0x00],
+            &[0x02],
+            &[0x45],
+            &[PING, PING],
+            &[0x45; 20],
+        ] {
             assert!(!is_heartbeat(other), "{other:?}");
         }
     }
 
-    #[tokio::test]
-    async fn only_pongs_move_the_deadline() {
-        let live = Liveness::default();
-        let at_start = live.last_pong();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!live.observe(&[0x45; 20]));
-        assert!(live.observe(&[PING]), "a stray ping is consumed too");
-        assert_eq!(live.last_pong(), at_start);
-        assert!(live.observe(&[PONG]));
-        assert!(live.last_pong() >= at_start + Duration::from_millis(20));
+    #[test]
+    fn quic_gives_up_only_after_the_watch() {
+        let quic = QuicConfig {
+            idle_timeout_secs: 4,
+            ..QuicConfig::default()
+        };
+        let watch_at_the_latest = timeout(&quic) + tick(timeout(&quic)) * 2;
+        assert!(quic_idle_timeout(&quic) > watch_at_the_latest);
     }
 }

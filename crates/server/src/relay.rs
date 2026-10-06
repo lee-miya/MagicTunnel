@@ -16,8 +16,8 @@ use crate::metrics::{RELAY_DOWN, RELAY_SESSIONS, RELAY_SESSIONS_TOTAL, RELAY_UP}
 use crate::node::reject;
 
 /// Runs one relayed tunnel: sets up the next link, passes the exit's reply back, then forwards
-/// datagrams both ways until either side goes away or the next hop stops answering
-/// heartbeats for `heartbeat_timeout`. Only setup failures are returned.
+/// datagrams both ways until either side goes away or nothing arrives on one of the links for
+/// `heartbeat_timeout`. Only setup failures are returned.
 pub async fn run(
     endpoint: &Endpoint,
     upstream: Connection,

@@ -17,7 +17,8 @@ use crate::relay;
 const REJECT_GRACE: Duration = Duration::from_secs(3);
 
 /// Serves every connection accepted on `endpoint` until it closes. Relays dial their next hop
-/// from the same endpoint and give it up after `heartbeat_timeout` without an answer.
+/// from the same endpoint. Every link is given up after `heartbeat_timeout` without a packet
+/// from its peer.
 pub async fn accept(
     endpoint: &Endpoint,
     exit: Option<ExitHandle>,
@@ -72,7 +73,10 @@ async fn session(
         return reject(&conn, control, &reason).await;
     }
     match (hello.remaining.split_first(), exit) {
-        (None, Some(exit)) => exit.tunnel(conn, control, hello.resume).await,
+        (None, Some(exit)) => {
+            exit.tunnel(conn, control, hello.resume, heartbeat_timeout)
+                .await
+        }
         (None, None) => reject(&conn, control, "this node is not an exit").await,
         (Some((next, rest)), _) => {
             relay::run(

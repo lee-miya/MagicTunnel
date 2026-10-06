@@ -19,7 +19,6 @@ pub use datagram::{
 };
 pub use endpoint::{bind_obfuscated, client_endpoint, connect, server_endpoint, transport_config};
 pub use error::{Error, Result};
-pub use heartbeat::Liveness;
 pub use obfs::{XorKey, XorSocket};
 pub use quinn;
 pub use tls::TlsMaterial;

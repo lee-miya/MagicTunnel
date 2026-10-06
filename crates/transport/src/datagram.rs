@@ -11,7 +11,7 @@ use magictunnel_common::metrics::{Counter, Traffic};
 use quinn::{Connection, SendDatagramError};
 use tokio::task::JoinSet;
 
-use crate::heartbeat::{self, Liveness};
+use crate::heartbeat;
 use crate::{Error, Result};
 
 /// Packets dropped because they did not fit one datagram on the current path.
@@ -81,21 +81,13 @@ pub async fn recv_packets(conn: &Connection, out: &mut Vec<Bytes>, max: usize) -
     Ok(())
 }
 
-/// Which end of a link the relay is on, for its heartbeats.
-enum Side {
-    /// The link was accepted: its pings are answered.
-    Accepted,
-    /// The link was dialed: its pongs are recorded.
-    Dialed(Arc<Liveness>),
-}
-
 /// Forwards datagrams between the connection `upstream` that was accepted and the one
 /// `downstream` dialed for it, passing payloads through untouched, until either connection
-/// fails or `downstream` stops answering heartbeats for `heartbeat_timeout`. Heartbeats belong
-/// to one link and are not forwarded. Each direction runs as its own task, so both can use a
-/// core. A packet too big for the onward link is answered with ICMP "fragmentation needed"
-/// back the way it came, so the path MTU stays discoverable end to end. Returns the error that
-/// stopped it; the caller is responsible for closing the connections.
+/// fails or nothing arrives on one of them for `heartbeat_timeout`. Heartbeats belong to one
+/// link and are not forwarded. Each direction runs as its own task, so both can use a core. A
+/// packet too big for the onward link is answered with ICMP "fragmentation needed" back the
+/// way it came, so the path MTU stays discoverable end to end. Returns the error that stopped
+/// it; the caller is responsible for closing the connections.
 pub async fn relay(
     upstream: Connection,
     downstream: Connection,
@@ -103,17 +95,13 @@ pub async fn relay(
     down: Arc<Traffic>,
     heartbeat_timeout: Duration,
 ) -> Error {
-    async fn pump(from: Connection, side: Side, to: Connection, meter: Arc<Traffic>) -> Error {
+    async fn pump(from: Connection, to: Connection, meter: Arc<Traffic>) -> Error {
         loop {
             let packet = match recv_packet(&from).await {
                 Ok(packet) => packet,
                 Err(e) => return e,
             };
-            let heartbeat = match &side {
-                Side::Accepted => heartbeat::answer(&from, &packet),
-                Side::Dialed(liveness) => liveness.observe(&packet),
-            };
-            if heartbeat {
+            if heartbeat::is_heartbeat(&packet) {
                 continue;
             }
             match send_packet(&to, packet.clone()) {
@@ -127,21 +115,12 @@ pub async fn relay(
             }
         }
     }
-    let liveness = Arc::new(Liveness::default());
     let mut tasks = JoinSet::new();
-    tasks.spawn(pump(
-        upstream.clone(),
-        Side::Accepted,
-        downstream.clone(),
-        up,
-    ));
-    tasks.spawn(pump(
-        downstream.clone(),
-        Side::Dialed(Arc::clone(&liveness)),
-        upstream,
-        down,
-    ));
-    tasks.spawn(async move { liveness.watch(&downstream, heartbeat_timeout).await });
+    tasks.spawn(pump(upstream.clone(), downstream.clone(), up));
+    tasks.spawn(pump(downstream.clone(), upstream.clone(), down));
+    for link in [upstream, downstream] {
+        tasks.spawn(async move { heartbeat::watch(&link, heartbeat_timeout).await });
+    }
     // Dropping the set aborts the others.
     match tasks.join_next().await.expect("tasks were spawned") {
         Ok(e) => e,

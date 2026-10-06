@@ -1,8 +1,9 @@
 //! End-to-end transport tests over loopback UDP with throwaway certificates.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use magictunnel_common::config::{DEFAULT_TUN_MTU, QuicConfig};
@@ -10,19 +11,21 @@ use magictunnel_common::metrics::Traffic;
 use magictunnel_common::proto::{HelloReply, Hop};
 use magictunnel_transport::quinn::{self, Endpoint};
 use magictunnel_transport::{
-    Error, Liveness, Sent, TlsMaterial, XorKey, accept_hello, client_endpoint, connect, heartbeat,
-    hello, recv_packet, recv_packets, relay, send_packet, send_packet_wait, server_endpoint,
+    Error, Sent, TlsMaterial, XorKey, accept_hello, client_endpoint, connect, heartbeat, hello,
+    recv_packet, recv_packets, relay, send_packet, send_packet_wait, server_endpoint,
 };
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
     KeyUsagePurpose,
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 const KEY: &[u8] = b"loopback-test-key";
 const NO_CONNECT_WAIT: Duration = Duration::from_secs(2);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Short enough for a test, long enough for a few one-second pings.
+/// Short enough for a test, long enough for several pings.
 const SHORT_HEARTBEAT: Duration = Duration::from_secs(2);
 
 struct Ca {
@@ -87,21 +90,21 @@ fn tunnel_reply() -> HelloReply {
     }
 }
 
-/// Exit node: completes the handshake with each peer, then answers heartbeats and echoes
-/// every other datagram. Peers that fail the handshake are skipped, as the negative tests
-/// expect.
+/// Exit node: completes the handshake with each peer, then echoes every datagram but
+/// heartbeats. Peers that fail the handshake are skipped, as the negative tests expect.
 fn spawn_exit(tls: &TlsMaterial) -> SocketAddr {
-    spawn_exit_with(tls, true)
+    spawn_exit_with(tls, HEARTBEAT_TIMEOUT).0
 }
 
-/// An exit that never answers heartbeats, as the dialer sees one its packets do not reach.
-fn spawn_mute_exit(tls: &TlsMaterial) -> SocketAddr {
-    spawn_exit_with(tls, false)
-}
-
-fn spawn_exit_with(tls: &TlsMaterial, answers: bool) -> SocketAddr {
+/// [`spawn_exit`] that gives a session up once nothing arrives on it for `heartbeat_timeout`,
+/// and reports why each session ended.
+fn spawn_exit_with(
+    tls: &TlsMaterial,
+    heartbeat_timeout: Duration,
+) -> (SocketAddr, mpsc::UnboundedReceiver<Error>) {
     let endpoint = server_endpoint(localhost(), xor_key(KEY), tls, &QuicConfig::default()).unwrap();
     let addr = endpoint.local_addr().unwrap();
+    let (ended, sessions) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let Ok(conn) = incoming.await else { continue };
@@ -110,21 +113,86 @@ fn spawn_exit_with(tls: &TlsMaterial, answers: bool) -> SocketAddr {
             };
             assert!(hello.remaining.is_empty());
             control.send(&tunnel_reply()).await.unwrap();
+            let ended = ended.clone();
             tokio::spawn(async move {
                 let _control = control;
-                while let Ok(packet) = recv_packet(&conn).await {
-                    if heartbeat::is_heartbeat(&packet) {
-                        if answers {
-                            heartbeat::answer(&conn, &packet);
+                let echo = async {
+                    loop {
+                        let packet = match recv_packet(&conn).await {
+                            Ok(packet) => packet,
+                            Err(e) => return e,
+                        };
+                        if heartbeat::is_heartbeat(&packet) {
+                            continue;
                         }
-                        continue;
+                        if let Err(e) = send_packet(&conn, packet) {
+                            return e;
+                        }
                     }
-                    send_packet(&conn, packet).unwrap();
-                }
+                };
+                let e = tokio::select! {
+                    e = echo => e,
+                    e = heartbeat::watch(&conn, heartbeat_timeout) => e,
+                };
+                let _ = ended.send(e);
             });
         }
     });
-    addr
+    (addr, sessions)
+}
+
+/// A UDP forwarder in front of `server` for one client, whose two directions can be cut, as on
+/// a path that breaks one way only.
+struct Path {
+    addr: SocketAddr,
+    up: Arc<AtomicBool>,
+    down: Arc<AtomicBool>,
+}
+
+async fn spawn_path(server: SocketAddr) -> Path {
+    let front = Arc::new(UdpSocket::bind(localhost()).await.unwrap());
+    let back = Arc::new(UdpSocket::bind(localhost()).await.unwrap());
+    back.connect(server).await.unwrap();
+    let client = Arc::new(Mutex::new(None));
+    let path = Path {
+        addr: front.local_addr().unwrap(),
+        up: Arc::new(AtomicBool::new(true)),
+        down: Arc::new(AtomicBool::new(true)),
+    };
+    let (rx, tx, from, open) = (
+        Arc::clone(&front),
+        Arc::clone(&back),
+        Arc::clone(&client),
+        Arc::clone(&path.up),
+    );
+    tokio::spawn(async move {
+        let mut buf = vec![0; 65536];
+        loop {
+            let Ok((len, peer)) = rx.recv_from(&mut buf).await else {
+                continue;
+            };
+            *from.lock().unwrap() = Some(peer);
+            if open.load(Relaxed) {
+                let _ = tx.send(&buf[..len]).await;
+            }
+        }
+    });
+    let open = Arc::clone(&path.down);
+    tokio::spawn(async move {
+        let mut buf = vec![0; 65536];
+        loop {
+            let Ok(len) = back.recv(&mut buf).await else {
+                continue;
+            };
+            let to = *client.lock().unwrap();
+            if let Some(to) = to
+                && open.load(Relaxed)
+            {
+                let _ = front.send_to(&buf[..len], to).await;
+            }
+        }
+    });
+    path
 }
 
 /// Relay node: dials the next hop named in the handshake, relays the reply back, then
@@ -168,11 +236,21 @@ async fn assert_echo(conn: &quinn::Connection) {
     for i in 0..10u8 {
         let packet = Bytes::from(vec![i; usize::from(DEFAULT_TUN_MTU)]);
         assert_eq!(send_packet(conn, packet.clone()).unwrap(), Sent::Queued);
-        let echoed = tokio::time::timeout(Duration::from_secs(5), recv_packet(conn))
+        let echoed = tokio::time::timeout(Duration::from_secs(5), recv_data(conn))
             .await
             .expect("echo timed out")
             .unwrap();
         assert_eq!(echoed, packet);
+    }
+}
+
+/// The next datagram that is not the peer's heartbeat.
+async fn recv_data(conn: &quinn::Connection) -> magictunnel_transport::Result<Bytes> {
+    loop {
+        let packet = recv_packet(conn).await?;
+        if !heartbeat::is_heartbeat(&packet) {
+            return Ok(packet);
+        }
     }
 }
 
@@ -364,84 +442,112 @@ async fn batches_queued_datagrams_and_waits_for_buffer_space() {
             .await
             .expect("echo timed out")
             .unwrap();
+        got.retain(|packet| !heartbeat::is_heartbeat(packet));
     }
     // Loopback does not reorder or lose, so the echoes arrive in order.
     let firsts: Vec<u8> = got.iter().map(|p| p[0]).collect();
     assert_eq!(firsts, (0..count).collect::<Vec<_>>());
 }
 
-/// Watches `conn` with `timeout`, feeding it whatever arrives; returns how long it took to
-/// give up, or `None` if it had not after `wait`.
-async fn watch_for(
-    conn: &quinn::Connection,
-    timeout: Duration,
-    wait: Duration,
-) -> Option<Duration> {
-    let liveness = Arc::new(Liveness::default());
-    let receiver = {
-        let (conn, liveness) = (conn.clone(), Arc::clone(&liveness));
-        tokio::spawn(async move {
-            while let Ok(packet) = recv_packet(&conn).await {
-                liveness.observe(&packet);
-            }
-        })
-    };
-    let started = tokio::time::Instant::now();
-    let result = tokio::time::timeout(wait, liveness.watch(conn, timeout)).await;
-    receiver.abort();
-    result.ok().map(|e| {
-        assert!(matches!(e, Error::Unresponsive(t) if t == timeout), "{e}");
+fn closed_with(e: &quinn::ConnectionError, reason: &[u8]) -> bool {
+    matches!(e, quinn::ConnectionError::ApplicationClosed(close) if close.reason[..] == *reason)
+}
+
+#[tokio::test]
+async fn heartbeats_keep_an_idle_link() {
+    let ca = Ca::new("test CA");
+    let (exit, mut ended) = spawn_exit_with(&ca.node("exit1"), SHORT_HEARTBEAT);
+    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, exit, "exit1").await;
+    let conn = conn.unwrap();
+    let (_control, _) = hello(&conn, vec![], None).await.unwrap();
+
+    // Keep-alives come far less often than this: only the pings carry the link.
+    let watch = heartbeat::watch(&conn, SHORT_HEARTBEAT);
+    let gave_up = tokio::time::timeout(SHORT_HEARTBEAT * 3, watch).await;
+    assert!(gave_up.is_err(), "the client gave up: {gave_up:?}");
+    assert!(ended.try_recv().is_err(), "the exit gave up");
+}
+
+#[tokio::test]
+async fn the_far_end_closes_a_link_whose_uplink_went_dark() {
+    let ca = Ca::new("test CA");
+    let (exit, mut ended) = spawn_exit_with(&ca.node("exit1"), SHORT_HEARTBEAT);
+    let path = spawn_path(exit).await;
+    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, path.addr, "exit1").await;
+    let conn = conn.unwrap();
+    let (_control, _) = hello(&conn, vec![], None).await.unwrap();
+
+    path.up.store(false, Relaxed);
+    let started = Instant::now();
+    // The client still hears the exit, so only the exit can tell; its close gets through.
+    let closed = tokio::time::timeout(SHORT_HEARTBEAT * 2, conn.closed())
+        .await
+        .expect("the client was not told");
+    assert!(
+        started.elapsed() >= SHORT_HEARTBEAT,
+        "after {:?}",
         started.elapsed()
-    })
+    );
+    assert!(closed_with(&closed, heartbeat::SILENT_PEER), "{closed}");
+    let why = ended.recv().await.unwrap();
+    assert!(
+        matches!(why, Error::Unresponsive(t) if t == SHORT_HEARTBEAT),
+        "{why}"
+    );
 }
 
 #[tokio::test]
-async fn heartbeats_keep_an_answering_link() {
+async fn the_near_end_gives_up_a_link_whose_downlink_went_dark() {
     let ca = Ca::new("test CA");
-    let exit = spawn_exit(&ca.node("exit1"));
-    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, exit, "exit1").await;
+    let (exit, mut ended) = spawn_exit_with(&ca.node("exit1"), SHORT_HEARTBEAT);
+    let path = spawn_path(exit).await;
+    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, path.addr, "exit1").await;
     let conn = conn.unwrap();
     let (_control, _) = hello(&conn, vec![], None).await.unwrap();
 
-    let gave_up = watch_for(&conn, SHORT_HEARTBEAT, SHORT_HEARTBEAT * 2).await;
-    assert_eq!(gave_up, None);
+    path.down.store(false, Relaxed);
+    let started = Instant::now();
+    let watch = heartbeat::watch(&conn, SHORT_HEARTBEAT);
+    let why = tokio::time::timeout(SHORT_HEARTBEAT * 2, watch)
+        .await
+        .expect("the client did not give up");
+    assert!(
+        started.elapsed() >= SHORT_HEARTBEAT,
+        "after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(why, Error::Unresponsive(t) if t == SHORT_HEARTBEAT),
+        "{why}"
+    );
+    // The exit still hears the client, so it learns from the client's close.
+    let why = tokio::time::timeout(Duration::from_secs(1), ended.recv())
+        .await
+        .expect("the exit was not told")
+        .unwrap();
+    assert!(
+        matches!(&why, Error::Connection(e) if closed_with(e, heartbeat::SILENT_PEER)),
+        "{why}"
+    );
 }
 
 #[tokio::test]
-async fn heartbeats_give_up_a_link_that_does_not_answer() {
+async fn relay_tears_the_path_down_when_its_next_link_goes_dark() {
     let ca = Ca::new("test CA");
-    let exit = spawn_mute_exit(&ca.node("exit1"));
-    let (_endpoint, conn) = dial(&ca.node("client1"), KEY, exit, "exit1").await;
-    let conn = conn.unwrap();
-    let (_control, _) = hello(&conn, vec![], None).await.unwrap();
-
-    // QUIC itself still sees a healthy link: the exit acknowledges every ping.
-    let gave_up = watch_for(&conn, SHORT_HEARTBEAT, SHORT_HEARTBEAT * 2).await;
-    let gave_up = gave_up.expect("the watch did not give up");
-    assert!(gave_up >= SHORT_HEARTBEAT, "after {gave_up:?}");
-    assert!(conn.close_reason().is_none());
-}
-
-#[tokio::test]
-async fn relay_answers_heartbeats_and_drops_a_mute_next_hop() {
-    let ca = Ca::new("test CA");
-    let exit = spawn_mute_exit(&ca.node("exit1"));
+    let (exit, mut ended) = spawn_exit_with(&ca.node("exit1"), SHORT_HEARTBEAT);
+    let path = spawn_path(exit).await;
     let relay = spawn_relay(&ca.node("relay1"), SHORT_HEARTBEAT);
     let (_endpoint, conn) = dial(&ca.node("client1"), KEY, relay, "relay1").await;
     let conn = conn.unwrap();
-    let (_control, _) = hello(&conn, exit_route(exit), None).await.unwrap();
+    let (_control, _) = hello(&conn, exit_route(path.addr), None).await.unwrap();
+    assert_echo(&conn).await;
 
-    // The relay answers the client's pings itself (the exit would not), until it gives up on
-    // the exit and closes the client's link.
-    heartbeat::ping(&conn).unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(1), recv_packet(&conn))
+    path.up.store(false, Relaxed);
+    // The exit notices, tells the relay, and the relay closes the client's link.
+    let closed = tokio::time::timeout(SHORT_HEARTBEAT * 2, conn.closed())
         .await
-        .expect("no answer to the ping")
-        .unwrap();
-    assert!(heartbeat::is_heartbeat(&reply), "{reply:?}");
-    let closed = tokio::time::timeout(SHORT_HEARTBEAT * 2, conn.closed()).await;
-    assert!(
-        matches!(closed, Ok(quinn::ConnectionError::ApplicationClosed(_))),
-        "{closed:?}"
-    );
+        .expect("the path was not torn down");
+    assert!(closed_with(&closed, b"relay closed"), "{closed}");
+    let why = ended.recv().await.unwrap();
+    assert!(matches!(why, Error::Unresponsive(_)), "{why}");
 }

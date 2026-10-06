@@ -12,9 +12,10 @@
 #                                           └─ web    198.51.100.80  HTTP, TCP echo
 #
 # Checks: the first hop crashing, the exit restarting and the uplink to the first hop going
-# dark (only one way) are all survived: the client notices (the last by heartbeat), keeps
-# TUN and routes (nothing leaks onto the LAN meanwhile), reconnects with backoff, gets its
-# tunnel address back, and a TCP connection open across all outages carries on; metrics
+# dark (only one way) are all survived: the client notices (the last because the relay tells
+# it), keeps TUN and routes (nothing leaks onto the LAN meanwhile), reconnects with backoff,
+# gets its tunnel address back, and a TCP connection open across all outages carries on; a
+# UDP flood far beyond the link rate does not drop the tunnel; metrics
 # endpoints and stats logs report all of it; when the path MTU shrinks mid-session, senders
 # get ICMP "fragmentation needed" from the client and the relay and TCP keeps working;
 # SIGTERM while reconnecting still restores the host.
@@ -286,7 +287,8 @@ check "exit: resumed sessions counted" test "$(metric exit magictunnel_resumed_s
 
 echo "== only the uplink to the first hop goes dark"
 # relay1's packets still reach the client, and its retransmissions keep the client's QUIC idle
-# timer fresh: without heartbeats this went unnoticed for about twice the idle timeout.
+# timer fresh: unless relay1 says it hears nothing, this goes unnoticed for about twice the
+# idle timeout.
 DARK=(FORWARD -i lan -p udp -d "$RELAY1" --dport 4433 -j DROP)
 lost=$(count 'tunnel lost' client.log)
 restored=$(count 'tunnel restored' client.log)
@@ -294,7 +296,7 @@ ns router iptables -I "${DARK[@]}"
 LOST=$SECONDS
 check "client notices within the idle timeout" wait_count client.log 'tunnel lost' $((lost + 1)) 6
 echo "  lost after $((SECONDS - LOST))s: $(grep -o 'tunnel lost.*' client.log | tail -1 | cut -c1-120)"
-check "it was the heartbeat that noticed" bash -c "grep 'tunnel lost' client.log | tail -1 | grep -q 'stopped answering heartbeats'"
+check "relay1 noticed and told the client" bash -c "grep 'tunnel lost' client.log | tail -1 | grep -q 'heard nothing from you'"
 ns router iptables -D "${DARK[@]}"
 check "client restores the tunnel" wait_count client.log 'tunnel restored' $((restored + 1)) 30
 echo "  restored $((SECONDS - LOST))s after the uplink went dark"
@@ -306,6 +308,21 @@ touch stop-chat
 rc=0; wait $CHAT || rc=$?
 expect "chat exit status" 0 echo $rc
 sed 's/^/  /' chat.log
+
+echo "== a UDP flood far above the link rate does not drop the tunnel"
+# Full datagram queues drop their oldest entries, heartbeats among them; a link this busy is
+# alive all the same. Web sends 150 Mbit/s through the tunnel to a client behind 10 Mbit/s.
+lost=$(count 'tunnel lost' client.log)
+ns router tc qdisc add dev v-client root netem rate 10mbit delay 5ms limit 40
+nsenter -t "${NS[web]}" -n python3 "$HERE/bulk.py" flood $WEB 7001 150 12 &
+FLOOD=$!
+BG+=($FLOOD)
+got=$(ns client python3 "$HERE/bulk.py" sink $WEB 7001 12)
+wait $FLOOD || true
+ns router tc qdisc del dev v-client root
+check "the flood came through the tunnel ($got Mbit/s)" test "$got" -gt 0
+expect "the client kept the tunnel" "$lost" count 'tunnel lost' client.log
+check "ping web again" ping_clean client $WEB 3
 
 echo "== SIGTERM while reconnecting restores the host"
 lost=$(count 'tunnel lost' client.log)

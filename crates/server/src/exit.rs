@@ -8,7 +8,7 @@
 use std::convert::Infallible;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use magictunnel_common::config::{ExitConfig, ExitTunConfig};
@@ -140,12 +140,14 @@ pub struct ExitHandle(Arc<Shared>);
 
 impl ExitHandle {
     /// Runs one client session whose route ends here: address lease, handshake reply, then
-    /// the uplink until the connection ends. Only setup failures are returned.
+    /// the uplink until the connection ends or nothing arrives on it for `heartbeat_timeout`.
+    /// Only setup failures are returned.
     pub async fn tunnel(
         &self,
         conn: Connection,
         mut control: ControlStream,
         resume: Option<Resume>,
+        heartbeat_timeout: Duration,
     ) -> anyhow::Result<()> {
         let shared = &*self.0;
         let peer = conn.remote_address();
@@ -190,7 +192,10 @@ impl ExitHandle {
         let up = Traffic::child_of(&EXIT_UP);
         // Pinning a session's writes to one queue keeps its packets in order.
         let queue = &shared.queues[u32::from(tunnel_ip) as usize % shared.queues.len()];
-        let e = uplink(&conn, shared, tunnel_ip, &up, Arc::clone(queue)).await;
+        let e = tokio::select! {
+            e = uplink(&conn, shared, tunnel_ip, &up, Arc::clone(queue)) => e,
+            e = heartbeat::watch(&conn, heartbeat_timeout) => e.into(),
+        };
         EXIT_SESSIONS.dec();
         tracing::info!(
             %peer,
@@ -235,7 +240,7 @@ async fn uplink(
                 meter.record(packet.len());
                 true
             }
-            _ if heartbeat::answer(conn, packet) => false,
+            _ if heartbeat::is_heartbeat(packet) => false,
             addrs => {
                 tracing::trace!(%tunnel_ip, ?addrs, len = packet.len(), "dropping client packet");
                 DROP_FILTERED.inc();

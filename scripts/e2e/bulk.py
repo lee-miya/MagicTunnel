@@ -4,11 +4,15 @@
     bulk.py serve ADDR PORT
     bulk.py up|down HOST PORT SECONDS
     bulk.py chat HOST PORT STOPFILE
+    bulk.py flood ADDR PORT MBIT SECONDS
+    bulk.py sink HOST PORT SECONDS
 
 `up` streams to the server for SECONDS and prints the Mbit/s the server actually received;
 `down` has the server stream for SECONDS and prints the Mbit/s received. `chat` sends a
 numbered line every 100 ms over one connection and checks every echo, until STOPFILE exists;
-it exits 0 only if the connection survived and every line came back in order.
+it exits 0 only if the connection survived and every line came back in order. `flood` waits
+for one UDP datagram, then sends its sender MBIT of UDP for SECONDS regardless of loss, like a
+sender without congestion control; `sink` asks for that and prints the Mbit/s received.
 """
 
 import os
@@ -100,12 +104,54 @@ def chat(host: str, port: int, stopfile: str) -> int:
     return 0 if state["echoed"] == sent and state["error"] is None else 1
 
 
+DATAGRAM = b"\0" * 1100
+
+
+def flood(addr: str, port: int, mbit: float, seconds: float) -> None:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((addr, port))
+    _, peer = s.recvfrom(64)
+    rate = mbit * 1e6 / 8 / len(DATAGRAM)
+    start = time.monotonic()
+    sent = 0
+    while (elapsed := time.monotonic() - start) < seconds:
+        while sent < elapsed * rate:
+            try:
+                s.sendto(DATAGRAM, peer)
+            except OSError:
+                pass
+            sent += 1
+        time.sleep(0.001)
+
+
+def sink(host: str, port: int, seconds: float) -> float:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.2)
+    start = time.monotonic()
+    total = 0
+    # Repeated in case the first request is lost.
+    asked = 0.0
+    while (elapsed := time.monotonic() - start) < seconds:
+        if total == 0 and elapsed - asked >= 0.5:
+            s.sendto(b"go", (host, port))
+            asked = elapsed
+        try:
+            total += len(s.recv(2048))
+        except socket.timeout:
+            pass
+    return total * 8 / seconds / 1e6
+
+
 def main() -> None:
     cmd = sys.argv[1]
     if cmd == "serve":
         serve(sys.argv[2], int(sys.argv[3]))
     elif cmd == "chat":
         sys.exit(chat(sys.argv[2], int(sys.argv[3]), sys.argv[4]))
+    elif cmd == "flood":
+        flood(sys.argv[2], int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5]))
+    elif cmd == "sink":
+        print(f"{sink(sys.argv[2], int(sys.argv[3]), float(sys.argv[4])):.0f}")
     else:
         fn = {"up": up, "down": down}[cmd]
         print(f"{fn(sys.argv[2], int(sys.argv[3]), float(sys.argv[4])):.0f}")

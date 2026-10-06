@@ -9,6 +9,7 @@ use quinn::{
     TransportConfig, VarInt,
 };
 
+use crate::heartbeat;
 use crate::obfs::{XorKey, XorSocket};
 use crate::tls::TlsMaterial;
 use crate::{Error, Result};
@@ -61,10 +62,9 @@ pub fn transport_config(quic: &QuicConfig) -> TransportConfig {
 
 fn idle_timeout(quic: &QuicConfig) -> IdleTimeout {
     // Config validation caps the timeout far below VarInt's range.
-    let millis = quic
-        .idle_timeout_secs
-        .saturating_mul(1000)
-        .min(u64::from(u32::MAX));
+    let millis = heartbeat::quic_idle_timeout(quic)
+        .as_millis()
+        .min(u128::from(u32::MAX));
     IdleTimeout::from(VarInt::from_u32(millis as u32))
 }
 

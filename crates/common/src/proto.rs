@@ -7,8 +7,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use serde::{Deserialize, Serialize};
 
 pub const ALPN: &[u8] = b"magictunnel/1";
-/// 2: the dialer of every link expects heartbeats answered, which version 1 nodes do not.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// 3: both ends of every link ping it and give it up once they hear nothing. Version 2 dialers
+/// wait for answers to their pings, which version 3 nodes do not send; version 1 nodes
+/// neither ping nor answer.
+pub const PROTOCOL_VERSION: u16 = 3;
 /// Longest route, exit included. Bounds the connections and handshake time one client can
 /// make a path spend.
 pub const MAX_HOPS: usize = 8;
