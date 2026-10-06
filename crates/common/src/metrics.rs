@@ -6,11 +6,13 @@
 use std::fmt::{Display, Write as _};
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Default)]
 pub struct Counter(AtomicU64);
@@ -162,6 +164,7 @@ impl Exposition {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST: usize = 8 * 1024;
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_CONNECTIONS: usize = 16;
 
 /// A bound metrics listener; binding up front makes a taken port a startup error.
 pub struct MetricsServer {
@@ -184,7 +187,14 @@ impl MetricsServer {
     where
         F: Fn() -> String + Clone + Send + 'static,
     {
+        let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         loop {
+            // Further connections wait in the listen backlog, so idle ones cannot use up the
+            // process's file descriptors.
+            let slot = Arc::clone(&slots)
+                .acquire_owned()
+                .await
+                .expect("semaphore is never closed");
             let stream = match self.listener.accept().await {
                 Ok((stream, _)) => stream,
                 // Errors here concern one connection or a momentary lack of file descriptors.
@@ -200,6 +210,7 @@ impl MetricsServer {
                 {
                     tracing::debug!("metrics request timed out: {e}");
                 }
+                drop(slot);
             });
         }
     }
@@ -312,5 +323,16 @@ mod tests {
         assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
         assert!(ok.ends_with("\r\n\r\nmt_up 1\n"), "{ok}");
         assert!(get("/").await.starts_with("HTTP/1.1 404"));
+
+        // Idle connections hold every slot; their slots come back once they hang up.
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        drop(idle);
+        let again = tokio::time::timeout(REQUEST_TIMEOUT / 2, get("/metrics"))
+            .await
+            .expect("slots were released");
+        assert!(again.starts_with("HTTP/1.1 200 OK\r\n"), "{again}");
     }
 }

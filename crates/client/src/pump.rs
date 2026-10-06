@@ -4,7 +4,6 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use anyhow::Context;
 use magictunnel_common::ip::{ipv4_addrs, is_ipv4};
 use magictunnel_transport::quinn::Connection;
 use magictunnel_transport::{Sent, recv_packets, send_packet_wait, too_large_reply};
@@ -14,34 +13,43 @@ use tun_rs::AsyncDevice;
 
 use crate::metrics::{DOWN, DROP_NOT_IPV4, TUN_WRITE_ERRORS, UP};
 
-/// Runs both directions until one fails, returning the error that stopped it. `max_mtu`
-/// bounds the TUN MTU over the device's lifetime.
-pub async fn run(dev: &Arc<AsyncDevice>, conn: &Connection, max_mtu: u16) -> anyhow::Error {
+/// Why the pumps stopped.
+#[derive(Debug)]
+pub enum Stop {
+    /// The tunnel connection failed; a new session can take over the same TUN.
+    Tunnel(anyhow::Error),
+    /// The TUN device failed, so reconnecting would not help.
+    Tun(anyhow::Error),
+}
+
+/// Runs both directions until one fails, returning why. `max_mtu` bounds the TUN MTU over the
+/// device's lifetime.
+pub async fn run(dev: &Arc<AsyncDevice>, conn: &Connection, max_mtu: u16) -> Stop {
     let mut tasks = JoinSet::new();
     tasks.spawn(uplink(Arc::clone(dev), conn.clone(), max_mtu));
     tasks.spawn(downlink(conn.clone(), Arc::clone(dev)));
-    let e = match tasks.join_next().await.expect("two tasks were spawned") {
-        Ok(Err(e)) => e,
+    let stop = match tasks.join_next().await.expect("two tasks were spawned") {
+        Ok(Err(stop)) => stop,
         Ok(Ok(never)) => match never {},
         Err(e) => std::panic::resume_unwind(e.into_panic()),
     };
     // A reconnect starts new pumps on the same TUN; the old ones must be gone by then.
     tasks.shutdown().await;
-    e
+    stop
 }
 
 /// TUN to tunnel. Waits for room in the connection's send buffer rather than dropping, so
 /// congestion pushes back on the local senders through the TUN queue.
-async fn uplink(
-    dev: Arc<AsyncDevice>,
-    conn: Connection,
-    max_mtu: u16,
-) -> anyhow::Result<Infallible> {
+async fn uplink(dev: Arc<AsyncDevice>, conn: Connection, max_mtu: u16) -> Result<Infallible, Stop> {
     let mut reader = TunReader::new(Arc::clone(&dev), max_mtu);
     let mut icmp = TunWriter::new(dev);
     let mut arena = Arena::default();
     loop {
-        for packet in reader.recv().await.context("reading from TUN")? {
+        let packets = reader
+            .recv()
+            .await
+            .map_err(|e| Stop::Tun(anyhow::Error::new(e).context("reading from TUN")))?;
+        for packet in packets {
             // The tunnel only carries IPv4; anything else the kernel emits on the TUN (e.g.
             // IPv6 router solicitations) is dropped here instead of being sent to the exit.
             if !is_ipv4(packet) {
@@ -51,7 +59,7 @@ async fn uplink(
             }
             let sent = send_packet_wait(&conn, arena.copy(packet))
                 .await
-                .context("sending to tunnel")?;
+                .map_err(|e| Stop::Tunnel(anyhow::Error::new(e).context("sending to tunnel")))?;
             match sent {
                 Sent::Queued => UP.record(packet.len()),
                 // The path shrank below the TUN MTU: tell the sender, as a router would, so
@@ -67,14 +75,14 @@ async fn uplink(
 }
 
 /// Tunnel to TUN, in batches of whatever has arrived, so offload can coalesce them.
-async fn downlink(conn: Connection, dev: Arc<AsyncDevice>) -> anyhow::Result<Infallible> {
+async fn downlink(conn: Connection, dev: Arc<AsyncDevice>) -> Result<Infallible, Stop> {
     let mut writer = TunWriter::new(dev);
     let mut batch = Vec::with_capacity(BATCH);
     loop {
         batch.clear();
         recv_packets(&conn, &mut batch, BATCH)
             .await
-            .context("receiving from tunnel")?;
+            .map_err(|e| Stop::Tunnel(anyhow::Error::new(e).context("receiving from tunnel")))?;
         batch.retain(|packet| {
             let ok = ipv4_addrs(packet).is_some();
             if ok {

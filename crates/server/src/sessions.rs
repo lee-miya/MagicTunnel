@@ -84,12 +84,14 @@ impl<C: Clone> Sessions<C> {
     /// Leases a tunnel address to `conn`: the one `resume` asks for if it is free or its
     /// token matches the current holder, otherwise the next free one. `None` when the pool
     /// is exhausted.
+    ///
+    /// A resumed address keeps the token the client presented: if the reply carrying the
+    /// token is lost, the client still holds the one that gets the address back next time.
     pub fn register(self: &Arc<Self>, conn: C, resume: Option<&Resume>) -> Option<Grant<C>> {
-        let token = new_token();
         let mut inner = self.inner.write().expect("session table poisoned");
-        let (addr, resumed, displaced) = match resume.and_then(|r| inner.claim(r)) {
-            Some((addr, displaced)) => (addr, true, displaced),
-            None => (inner.pool.allocate()?, false, None),
+        let (addr, token, resumed, displaced) = match resume.and_then(|r| inner.claim(r)) {
+            Some((addr, token, displaced)) => (addr, token, true, displaced),
+            None => (inner.pool.allocate()?, new_token(), false, None),
         };
         let id = inner.next_lease;
         inner.next_lease += 1;
@@ -121,15 +123,20 @@ impl<C: Clone> Sessions<C> {
 }
 
 impl<C: Clone> Inner<C> {
-    /// The address `resume` asks for, plus the connection it is taken from, if any.
-    fn claim(&mut self, resume: &Resume) -> Option<(Ipv4Addr, Option<C>)> {
+    /// The address `resume` asks for, its token, and the connection it is taken from, if any.
+    fn claim(&mut self, resume: &Resume) -> Option<(Ipv4Addr, String, Option<C>)> {
         let addr = resume.tunnel_ip;
         if self.pool.reserve(addr) {
-            return Some((addr, None));
+            let token = resume
+                .token
+                .clone()
+                .filter(|t| is_token(t))
+                .unwrap_or_else(new_token);
+            return Some((addr, token, None));
         }
         let entry = self.conns.get(&addr)?;
         let owner = resume.token.as_deref() == Some(entry.token.as_str());
-        owner.then(|| (addr, Some(entry.conn.clone())))
+        owner.then(|| (addr, entry.token.clone(), Some(entry.conn.clone())))
     }
 }
 
@@ -172,6 +179,14 @@ fn new_token() -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+/// Whether `token` looks like one [`new_token`] makes.
+fn is_token(token: &str) -> bool {
+    token.len() == 2 * TOKEN_BYTES
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]
@@ -234,6 +249,7 @@ mod tests {
             (new.lease.addr(), new.resumed, new.displaced),
             (addr, true, Some("old"))
         );
+        assert_eq!(new.token, old.token);
         assert_eq!(s.lookup(addr), Some("new"));
 
         // The old session ending must not take the address from the new one.
@@ -242,6 +258,45 @@ mod tests {
         drop(new);
         assert_eq!(s.lookup(addr), None);
         assert_eq!(s.usage(), (1, 5));
+    }
+
+    #[test]
+    fn resuming_keeps_the_token_when_a_reply_is_lost() {
+        let s = sessions();
+        let first = s.register("first", None).unwrap();
+        let (addr, token) = (first.lease.addr().to_string(), first.token.clone());
+        // The client never sees the reply to its first reconnect and retries with the same
+        // token while that connection still holds the address.
+        let lost = s
+            .register("lost", Some(&resume(&addr, Some(&token))))
+            .unwrap();
+        let retry = s
+            .register("retry", Some(&resume(&addr, Some(&token))))
+            .unwrap();
+        assert_eq!(
+            (retry.lease.addr(), retry.resumed, retry.displaced),
+            (first.lease.addr(), true, Some("lost"))
+        );
+        assert_eq!((&lost.token, &retry.token), (&token, &token));
+    }
+
+    #[test]
+    fn a_free_address_adopts_a_well_formed_token() {
+        let s = sessions();
+        let token = "0123456789abcdef0123456789abcdef";
+        let g = s
+            .register("a", Some(&resume("10.88.0.5", Some(token))))
+            .unwrap();
+        assert_eq!(g.token, token);
+        for bad in ["short", "0123456789ABCDEF0123456789ABCDEF"] {
+            let g = s
+                .register("b", Some(&resume("10.88.0.6", Some(bad))))
+                .unwrap();
+            assert!(g.resumed);
+            assert_ne!(g.token, bad);
+            assert!(is_token(&g.token));
+            drop(g);
+        }
     }
 
     #[test]

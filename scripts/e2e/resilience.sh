@@ -139,7 +139,11 @@ nsenter -t "${NS[web]}" -n python3 "$HERE/bulk.py" serve $WEB 7000 &
 BG+=($!)
 ns client ip -4 route show >routes.before
 
-count() { grep -c "$1" "$2" 2>/dev/null || true; }
+count() {
+  local n
+  n=$(grep -c "$1" "$2" 2>/dev/null) || true
+  echo "${n:-0}"
+}
 # start_server NAME NS: appends to NAME.log; sets PID_NAME.
 start_server() {
   local started i
@@ -172,6 +176,8 @@ echo "== tunnel up"
 # The TUN MTU is what every link could carry at handshake time, which depends on how far QUIC
 # MTU discovery got on each. The path MTU test needs more than QUIC's 1280-byte floor carries.
 for ((attempt = 1; attempt <= 10; attempt++)); do
+  # Otherwise the previous attempt's "tunnel up" may be found before the redirect truncates it.
+  rm -f client.log
   nsenter -t "${NS[client]}" -n "$BIN/mt-client" -c client.toml >client.log 2>&1 &
   CLI=$!
   BG+=($CLI)
@@ -214,7 +220,10 @@ if ((TUN_MTU > 1260)); then
   DOWN=$!
   sleep 1
   # 1320 still carries the 1280-byte QUIC minimum (plus nonce and headers), not the TUN MTU.
+  # The router's side shrinks too: a veth delivers GSO batches whatever its MTU, so only IP
+  # forwarding, which checks every segment, drops the relay's large datagrams reliably.
   ns client ip link set eth0 mtu 1320
+  ns router ip link set lan mtu 1320
   big=$((TUN_MTU - 28))
   for ((i = 0; i < 30; i++)); do
     ns client ping -c 3 -i 0.2 -W 1 -M do -s $big $WEB >>pmtu-ping.txt 2>&1 || true
@@ -232,6 +241,7 @@ if ((TUN_MTU > 1260)); then
   check "relay1 told web to shrink" test "$(metric relay1 magictunnel_icmp_frag_needed_sent_total)" -gt 0
   check "a new 2 MB download is intact" blob_intact client
   check "ping with small packets still clean" ping_clean client $WEB 3 -s 1000
+  ns router ip link set lan mtu 1500
   ns client ip link set eth0 mtu 1500
 else
   echo "  skipped: the handshake settled on TUN MTU $TUN_MTU, which always fits"

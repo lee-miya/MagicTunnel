@@ -9,7 +9,7 @@ mod tun;
 use std::hash::{BuildHasher, RandomState};
 use std::path::PathBuf;
 use std::pin::pin;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Parser;
@@ -22,6 +22,8 @@ use crate::route::RouteGuard;
 use crate::session::Session;
 
 const FIRST_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// A session that lasted this long resets the reconnect backoff.
+const STABLE_SESSION: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(name = "mt-client", version, about = "magicTunnel client")]
@@ -98,10 +100,12 @@ async fn run(cfg: &ClientConfig, mut session: Session) -> anyhow::Result<()> {
         "tunnel up"
     );
 
+    let mut backoff = Backoff::new(Duration::from_secs(cfg.reconnect.max_delay_secs));
     loop {
         metrics::set_current(Some(session.conn.clone()));
-        let e = tokio::select! {
-            e = pump::run(&tun.dev, &session.conn, cfg.tun.mtu) => e,
+        let up_since = Instant::now();
+        let stop = tokio::select! {
+            stop = pump::run(&tun.dev, &session.conn, cfg.tun.mtu) => stop,
             signal = &mut shutdown => {
                 tracing::info!("received {signal}, shutting down");
                 metrics::set_current(None);
@@ -110,17 +114,33 @@ async fn run(cfg: &ClientConfig, mut session: Session) -> anyhow::Result<()> {
             }
         };
         metrics::set_current(None);
+        let e = match stop {
+            pump::Stop::Tunnel(e) => e,
+            pump::Stop::Tun(e) => {
+                session.close().await;
+                return Err(e.context("TUN device failed"));
+            }
+        };
         if !cfg.reconnect.enabled {
             session.close().await;
             return Err(e.context("tunnel failed"));
         }
-        tracing::warn!("tunnel lost, reconnecting: {e:#}");
+        // A session that keeps failing right after it comes up must not be redialled in a
+        // tight loop: only a stable one resets the backoff.
+        let stable = up_since.elapsed() >= STABLE_SESSION;
+        if stable {
+            backoff.reset();
+        }
+        tracing::warn!(
+            up_secs = up_since.elapsed().as_secs(),
+            "tunnel lost, reconnecting: {e:#}"
+        );
         let resume = session.resume();
         let old = (session.tunnel_ip, session.prefix_len);
         session.close().await;
 
         session = tokio::select! {
-            s = reconnect(cfg, resume) => s,
+            s = reconnect(cfg, resume, &mut backoff, stable) => s,
             signal = &mut shutdown => {
                 tracing::info!("received {signal} while reconnecting, shutting down");
                 return Ok(());
@@ -153,26 +173,63 @@ async fn run(cfg: &ClientConfig, mut session: Session) -> anyhow::Result<()> {
 }
 
 /// Dials the route until it works, backing off exponentially (with jitter, so clients of a
-/// restarted exit do not return in lockstep) up to `reconnect.max_delay_secs`.
-async fn reconnect(cfg: &ClientConfig, resume: Resume) -> Session {
-    let max_delay = Duration::from_secs(cfg.reconnect.max_delay_secs);
-    let mut delay = FIRST_RETRY_DELAY.min(max_delay);
+/// restarted exit do not return in lockstep) up to `reconnect.max_delay_secs`. The first
+/// attempt is immediate only when `now`.
+async fn reconnect(
+    cfg: &ClientConfig,
+    resume: Resume,
+    backoff: &mut Backoff,
+    now: bool,
+) -> Session {
+    if !now {
+        let wait = backoff.next();
+        tracing::info!(
+            retry_in_ms = wait.as_millis() as u64,
+            "previous session was short-lived, waiting before reconnecting"
+        );
+        tokio::time::sleep(wait).await;
+    }
     let mut attempt = 1u32;
     loop {
         match Session::establish(cfg, Some(resume.clone())).await {
             Ok(session) => return session,
             Err(e) => {
-                let wait = jitter(delay);
+                let wait = backoff.next();
                 tracing::warn!(
                     attempt,
                     retry_in_ms = wait.as_millis() as u64,
                     "reconnect failed: {e:#}"
                 );
                 tokio::time::sleep(wait).await;
-                delay = (delay * 2).min(max_delay);
                 attempt += 1;
             }
         }
+    }
+}
+
+/// Exponential reconnect delay, kept across sessions until one proves stable.
+struct Backoff {
+    delay: Duration,
+    max: Duration,
+}
+
+impl Backoff {
+    fn new(max: Duration) -> Self {
+        Self {
+            delay: FIRST_RETRY_DELAY.min(max),
+            max,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.delay = FIRST_RETRY_DELAY.min(self.max);
+    }
+
+    /// The next wait (jittered), doubling the one after it.
+    fn next(&mut self) -> Duration {
+        let wait = jitter(self.delay);
+        self.delay = (self.delay * 2).min(self.max);
+        wait
     }
 }
 
@@ -242,5 +299,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_the_cap_and_resets() {
+        let mut b = Backoff::new(Duration::from_secs(5));
+        let delays: Vec<_> = (0..5)
+            .map(|_| {
+                b.next();
+                b.delay
+            })
+            .collect();
+        assert_eq!(delays, [2, 4, 5, 5, 5].map(Duration::from_secs));
+        b.reset();
+        assert!(b.next() < Duration::from_millis(1250));
+
+        let mut tight = Backoff::new(Duration::from_millis(500));
+        assert!(tight.next() < Duration::from_millis(625));
     }
 }
